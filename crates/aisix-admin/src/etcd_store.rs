@@ -30,7 +30,7 @@ use crate::store::{ConfigStore, StoreError};
 /// Subkey segments used under the configured prefix. Mirrored in
 /// `aisix-etcd`'s loader so the two paths agree at the byte level.
 pub const MODELS_SUBKEY: &str = "models";
-pub const APIKEYS_SUBKEY: &str = "apikeys";
+pub const APIKEYS_SUBKEY: &str = "api_keys";
 pub const CREDENTIALS_SUBKEY: &str = "credentials";
 pub const BUDGETS_SUBKEY: &str = "budgets";
 pub const TEAMS_SUBKEY: &str = "teams";
@@ -315,7 +315,7 @@ mod tests {
     fn key_for_matches_spec_layout() {
         let store = dummy_store();
         assert_eq!(store.key_for("models", "abc-1"), "/aisix/models/abc-1");
-        assert_eq!(store.key_for("apikeys", "xyz"), "/aisix/apikeys/xyz");
+        assert_eq!(store.key_for("api_keys", "xyz"), "/aisix/api_keys/xyz");
     }
 
     #[test]
@@ -332,7 +332,7 @@ mod tests {
             Some("abc-1"),
         );
         // Wrong kind prefix → None.
-        assert!(store.id_from_key("/aisix/apikeys/x", "models").is_none());
+        assert!(store.id_from_key("/aisix/api_keys/x", "models").is_none());
         // Outside the configured prefix → None.
         assert!(store.id_from_key("/other/models/x", "models").is_none());
     }

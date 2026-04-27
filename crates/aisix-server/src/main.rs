@@ -112,30 +112,55 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }
         if !bundle_on_disk && can_register {
             tracing::info!("managed mode: registering with aisix.cloud CP");
+            let cp_etcd = cfg
+                .managed
+                .cp_etcd_endpoint
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "managed mode: cp_etcd_endpoint must be set (v3 register no longer \
+                         returns the etcd endpoint; the DP container must know it at boot — \
+                         set AISIX_MANAGED__CP_ETCD_ENDPOINT to host:port form)"
+                    )
+                })?
+                .to_string();
             let r = register::register_and_persist(&cfg.managed)
                 .await
                 .map_err(|e| anyhow::anyhow!("DP registration failed: {e:#}"))?;
             tracing::info!(
                 dp_id = %r.dp_id,
-                gateway_id = %r.gateway_id,
-                etcd = %r.etcd_endpoint,
+                env_id = %r.env_id,
+                etcd = %cp_etcd,
                 "registered with control plane",
             );
-            // Override the static config with what the CP handed back.
-            // Endpoints get the https:// scheme re-attached (the CP
-            // sends a bare host:port, but tonic-based etcd-client
-            // expects a full URL for TLS endpoints).
-            cfg.etcd.endpoints = vec![format!("https://{}", r.etcd_endpoint)];
+            // Plumb the v3 register output into the static config:
+            //   - etcd endpoint comes from cp_etcd_endpoint (v3 no
+            //     longer returns it in the response).
+            //   - env_id comes from the register response and scopes
+            //     every etcd read/watch to /aisix/<env_id>/.
+            //   - mTLS bundle paths are the freshly persisted files.
+            cfg.etcd.endpoints = vec![format!("https://{cp_etcd}")];
+            cfg.etcd.env_id = r.env_id.clone();
             cfg.etcd.tls = Some(EtcdTlsConfig {
                 ca_cert_file: r.ca_cert_path.to_string_lossy().into_owned(),
                 client_cert_file: r.client_cert_path.to_string_lossy().into_owned(),
                 client_key_file: r.client_key_path.to_string_lossy().into_owned(),
                 domain_name: None, // derive from endpoint host
             });
+            // v3 heartbeat is mTLS-required (cp-side reads peer cert
+            // SAN for dp_id), bearer-token path was retired with the
+            // v2 CP. The PHASE-2 follow-up swaps HeartbeatConfig to
+            // an mTLS-aware reqwest client. For now we use the
+            // cp_base_url + heartbeat_path the register response
+            // told us about; the v3 dp-manager will return 401
+            // (MTLS_REQUIRED) until phase 2 lands. The DP keeps
+            // running — heartbeat is liveness-only, not load-bearing.
+            let cp_base = cfg.managed.cp_base_url.clone().unwrap_or_default();
             Some(heartbeat::HeartbeatConfig::sanitised(
-                r.heartbeat_url,
+                format!("{}{}", cp_base.trim_end_matches('/'), r.heartbeat_path),
                 r.dp_id,
-                r.heartbeat_interval,
+                std::time::Duration::from_secs(15),
             ))
         } else if bundle_on_disk {
             // Bundle persisted from a previous boot; load the dp_id
@@ -190,10 +215,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     probe_etcd_dns(&cfg.etcd.endpoints).await;
 
     let connect_options = build_etcd_connect_options(&cfg.etcd)?;
+    // effective_prefix() is `<prefix>/<env_id>` in v3 managed mode
+    // (env_id populated from the register response above), bare
+    // `<prefix>` in self-hosted dev where env_id is empty.
+    let etcd_prefix = cfg.etcd.effective_prefix();
     let provider = Arc::new(
         EtcdConfigProvider::connect(
             &cfg.etcd.endpoints,
-            cfg.etcd.prefix.clone(),
+            etcd_prefix.clone(),
             connect_options.clone(),
         )
         .await
@@ -226,7 +255,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     };
     let supervisor = Arc::new(Supervisor::with_cache(
         provider,
-        cfg.etcd.prefix.clone(),
+        etcd_prefix.clone(),
         snapshot_cache,
     ));
     // Seed the snapshot from disk before the etcd cycle starts so the
@@ -305,7 +334,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // the Playground would bypass the aisix.cloud control plane.
     let admin_serve_handle = if let Some(admin_client) = admin_client {
         let admin_store: Arc<dyn ConfigStore> =
-            Arc::new(EtcdConfigStore::new(admin_client, cfg.etcd.prefix.clone()));
+            Arc::new(EtcdConfigStore::new(admin_client, etcd_prefix.clone()));
         let admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
             .with_metrics(metrics.clone())
             // Share the in-process budget tracker so /admin/v1/spend reports
@@ -654,6 +683,7 @@ mod tests {
         let etcd = aisix_core::EtcdConfig {
             endpoints: vec!["http://127.0.0.1:2379".into()],
             prefix: "/aisix".into(),
+            env_id: String::new(),
             user: None,
             password_env: None,
             dial_timeout_ms: 5000,
@@ -672,6 +702,7 @@ mod tests {
         let etcd = aisix_core::EtcdConfig {
             endpoints: vec!["https://etcd.aisix.cloud:2379".into()],
             prefix: "/aisix".into(),
+            env_id: String::new(),
             user: None,
             password_env: None,
             dial_timeout_ms: 5000,

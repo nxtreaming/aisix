@@ -55,8 +55,19 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct EtcdConfig {
     pub endpoints: Vec<String>,
+    /// Base namespace shared by every aisix DP. v2 used the bare
+    /// `prefix` as the etcd key root (`/aisix/{kind}/{id}`); v3
+    /// inserts an env scope so each DP only sees its own env's
+    /// resources (`/aisix/<env_id>/{kind}/{id}`, prd-09a §9A.6).
+    /// The DP populates `env_id` from the v3 register response at
+    /// boot; in self-managed mode the operator sets it directly.
     #[serde(default = "EtcdConfig::default_prefix")]
     pub prefix: String,
+    /// Tenant scope inserted between `prefix` and the resource kind
+    /// segment. Empty string = legacy/unscoped behavior (v2). The
+    /// register flow overwrites this from the CP's response.
+    #[serde(default)]
+    pub env_id: String,
     #[serde(default)]
     pub user: Option<String>,
     /// Name of the env var that contains the password. The actual secret is
@@ -128,6 +139,14 @@ pub struct ManagedConfig {
     #[serde(default)]
     pub cp_base_url: Option<String>,
 
+    /// aisix.cloud CP etcd endpoint, e.g. "etcd.us.aisix.cloud:7943".
+    /// In v2 the CP returned this in the register response; v3
+    /// (prd-09a §9A.7.2) no longer ships it back, so the DP must
+    /// know its etcd endpoint at boot. Bare `host:port` without
+    /// scheme — the DP attaches `https://` for the gRPC dial.
+    #[serde(default)]
+    pub cp_etcd_endpoint: Option<String>,
+
     /// Directory where the DP persists `ca.crt`, `client.crt`,
     /// `client.key` received from the register response. Files are
     /// written `0600`. Parent directory must already exist and be
@@ -197,6 +216,19 @@ impl EtcdConfig {
 
     pub const fn request_timeout(&self) -> Duration {
         Duration::from_millis(self.request_timeout_ms)
+    }
+
+    /// The full env-scoped key prefix the DP watches and parses.
+    /// v3: `<prefix>/<env_id>` (e.g. `/aisix/<uuid>`); v2 fallback
+    /// (env_id empty): bare `<prefix>` for backwards compat with
+    /// self-managed deployments that haven't migrated yet.
+    pub fn effective_prefix(&self) -> String {
+        if self.env_id.is_empty() {
+            self.prefix.clone()
+        } else {
+            let trimmed = self.prefix.trim_end_matches('/');
+            format!("{trimmed}/{}", self.env_id)
+        }
     }
 }
 

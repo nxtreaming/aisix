@@ -72,8 +72,12 @@ impl Resource for ApiKey {
         &self.key
     }
 
+    /// Path segment under `/aisix/<env>/`. v3 (prd-09a §9A.7B.2) uses
+    /// the underscored form `api_keys` to align with cp-api migration
+    /// 008's table name. v2 used `apikeys` (no underscore); the v3
+    /// dp-manager only writes the underscored form.
     fn kind() -> &'static str {
-        "apikeys"
+        "api_keys"
     }
 }
 
@@ -163,7 +167,7 @@ mod tests {
     fn resource_trait_points_at_key_and_kind() {
         let mut k = sample();
         k.runtime_id = "uuid-ak".into();
-        assert_eq!(<ApiKey as Resource>::kind(), "apikeys");
+        assert_eq!(<ApiKey as Resource>::kind(), "api_keys");
         assert_eq!(k.id(), "uuid-ak");
         assert_eq!(k.name(), "sk-my-api-key-123");
     }

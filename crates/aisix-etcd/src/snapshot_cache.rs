@@ -217,7 +217,7 @@ mod tests {
         let cache = SnapshotCache::new(dir.path().join("snap.json"));
         let entries = vec![
             entry("/aisix/models/m-1", br#"{"name":"m1"}"#, 7),
-            entry("/aisix/apikeys/k-1", b"\xff\x00\x01raw", 8),
+            entry("/aisix/api_keys/k-1", b"\xff\x00\x01raw", 8),
         ];
         cache.store(&entries, 42).await;
 

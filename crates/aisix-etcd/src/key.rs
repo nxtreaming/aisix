@@ -67,8 +67,8 @@ mod tests {
 
     #[test]
     fn trailing_slash_in_prefix_is_tolerated() {
-        let k = parse("/aisix/", "/aisix/apikeys/uuid-1").unwrap();
-        assert_eq!(k.kind, "apikeys");
+        let k = parse("/aisix/", "/aisix/api_keys/uuid-1").unwrap();
+        assert_eq!(k.kind, "api_keys");
         assert_eq!(k.id, "uuid-1");
     }
 
