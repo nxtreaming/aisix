@@ -44,6 +44,8 @@ anyhow.workspace = true
 tracing.workspace = true
 etcd-client.workspace = true
 reqwest.workspace = true
+rcgen.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

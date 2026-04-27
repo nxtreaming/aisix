@@ -72,7 +72,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     snapshot.models.insert(entry);
                 }
             }
-            "apikeys" => {
+            "api_keys" => {
                 if let Some(entry) = validate_and_parse::<ApiKey>(
                     &raw.key,
                     raw.revision,
@@ -177,7 +177,7 @@ mod tests {
     fn builds_snapshot_for_happy_entries() {
         let entries = vec![
             raw("/aisix/models/m-1", VALID_MODEL, 2),
-            raw("/aisix/apikeys/k-1", VALID_APIKEY, 3),
+            raw("/aisix/api_keys/k-1", VALID_APIKEY, 3),
         ];
         let (snap, stats) = build_snapshot("/aisix", &entries);
 
@@ -234,7 +234,7 @@ mod tests {
             raw("/aisix/models/m-1", VALID_MODEL, 1),
             raw("/aisix/models/bad", b"not-json", 2),
             raw("/aisix/models/m-2", VALID_MODEL, 3), // same name -> update in place
-            raw("/aisix/apikeys/k-1", VALID_APIKEY, 4),
+            raw("/aisix/api_keys/k-1", VALID_APIKEY, 4),
         ];
         let (snap, stats) = build_snapshot("/aisix", &entries);
         assert_eq!(stats.accepted, 3);

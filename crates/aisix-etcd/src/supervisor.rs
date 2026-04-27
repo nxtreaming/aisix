@@ -208,7 +208,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         let new = clone_snapshot(&self.handle.load());
         let removed = match parsed.kind {
             "models" => new.models.remove(parsed.id).is_some(),
-            "apikeys" => new.apikeys.remove(parsed.id).is_some(),
+            "api_keys" => new.apikeys.remove(parsed.id).is_some(),
             _ => false,
         };
         if removed {
