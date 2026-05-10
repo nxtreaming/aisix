@@ -1153,6 +1153,15 @@ where
         // the bookkeeping robust to a provider that double-emits.
         // `chunk.id` / `chunk.model` / `chunk.finish_reason` use
         // last-seen-wins because those are stable per stream.
+        //
+        // Per docs/api-proxy.md §5: "If the upstream stream
+        // terminates abnormally, aisix sends a final error chunk
+        // and closes the response without `[DONE]`." Track whether
+        // an error has been yielded so we can skip the closing
+        // `[DONE]` — without this skip, a downstream SDK that
+        // treats `[DONE]` as clean-completion would mis-interpret
+        // the truncated response as a successful one.
+        let mut errored = false;
         while let Some(item) = upstream.next().await {
             let ev = match item {
                 Ok(chunk) => {
@@ -1193,14 +1202,21 @@ where
                     let rendered = render_chunk(created, chunk);
                     match serde_json::to_string(&rendered) {
                         Ok(json) => Event::default().data(json),
-                        Err(err) => Event::default()
-                            .event("error")
-                            .data(err.to_string()),
+                        Err(err) => {
+                            errored = true;
+                            Event::default()
+                                .event("error")
+                                .data(error_frame_payload("internal_error", &err.to_string()))
+                        }
                     }
                 }
-                Err(err) => Event::default()
-                    .event("error")
-                    .data(err.to_string()),
+                Err(err) => {
+                    errored = true;
+                    let etype = err.error_type();
+                    Event::default()
+                        .event("error")
+                        .data(error_frame_payload(etype, &err.to_string()))
+                }
             };
             yield Ok::<_, Infallible>(ev);
         }
@@ -1214,10 +1230,39 @@ where
         // accumulator's numeric fields stay 0; on_complete callers
         // must treat 0 as "no signal" (cp-api does — its pricing
         // catalog falls back to the standard rate when absent).
-        yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+        //
+        // Per docs §5: skip `[DONE]` on abnormal termination so SDK
+        // consumers can detect truncation. The `errored` flag is
+        // set by the loop above whenever an error event is yielded.
+        if !errored {
+            yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+        }
         // `guard` drops here. On client disconnect, the generator
         // drops at the suspension point inside the loop; Drop fires
         // there with whatever StreamCompletion has been captured up
         // to that point.
     }
+}
+
+/// Build the `data:` payload for an SSE `event: error` frame.
+/// The OpenAI Node SDK calls `JSON.parse(sse.data)` BEFORE checking
+/// `sse.event === "error"`, so a plain-string payload yields a
+/// `SyntaxError` ("Could not parse message into JSON: ...") on the
+/// SDK side rather than the typed `APIError` callers expect. Emit
+/// the OpenAI error envelope shape per
+/// <https://platform.openai.com/docs/guides/error-codes/api-errors>:
+/// `{"error": {"message": "...", "type": "..."}}`.
+fn error_frame_payload(error_type: &str, message: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+        }
+    }))
+    // unreachable in practice — `serde_json::to_string` of a
+    // `Value` cannot fail. The fallback emits a minimal valid
+    // envelope so SDK consumers' `JSON.parse` still succeeds.
+    .unwrap_or_else(|_| {
+        r#"{"error":{"message":"error","type":"internal_error"}}"#.into()
+    })
 }
