@@ -134,6 +134,11 @@ async fn enforce_request_body_limit(
         .and_then(|s| s.parse::<usize>().ok())
     {
         if declared > state.request_body_limit_bytes {
+            // Drain the inbound body so hyper can flush the 413 response
+            // on the same HTTP/1.1 connection. Without this, hyper closes
+            // the socket while the client is still writing, and the client
+            // sees EPIPE/ECONNRESET instead of the 413.
+            drain_body(request.into_body()).await;
             return ProxyError::RequestTooLarge {
                 limit_bytes: state.request_body_limit_bytes,
             }
@@ -141,6 +146,32 @@ async fn enforce_request_body_limit(
         }
     }
     next.run(request).await
+}
+
+/// Read and discard the inbound body, bounded by both bytes and time.
+///
+/// Byte cap (32 MiB) prevents a huge `Content-Length` from consuming
+/// unbounded memory.  Time cap (5 s) prevents a slowloris-style
+/// client from holding the task indefinitely by dribbling data.
+async fn drain_body(body: axum::body::Body) {
+    use http_body_util::BodyExt;
+
+    const DRAIN_CAP: usize = 32 * 1024 * 1024;
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let mut drained = 0usize;
+        let mut body = body;
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Some(data) = frame.data_ref() {
+                drained += data.len();
+                if drained >= DRAIN_CAP {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
 }
 
 async fn health(
