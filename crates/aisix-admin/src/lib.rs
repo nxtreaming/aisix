@@ -1,7 +1,12 @@
 //! aisix-admin — Admin API + Playground (:3001).
 //!
-//! Mounts the admin surface behind admin-key bearer auth:
+//! Public admin-listener endpoints:
 //! - `GET  /health`
+//! - `GET  /metrics`
+//! - `GET  /admin/openapi.json`
+//! - `GET  /admin/openapi-scalar`
+//!
+//! Admin-key protected routes:
 //! - `GET|POST            /admin/v1/models`
 //! - `GET|PUT|DELETE      /admin/v1/models/:id`
 //! - `GET|POST            /admin/v1/apikeys`
@@ -139,16 +144,11 @@ pub fn build_router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-async fn health(
-    axum::extract::State(state): axum::extract::State<AdminState>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let snap = state.snapshot.load();
+async fn health(_state: axum::extract::State<AdminState>) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::OK,
         Json(json!({
             "status": "ok",
-            "models": snap.models.len(),
-            "apikeys": snap.apikeys.len(),
         })),
     )
 }
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_snapshot_counts() {
+    async fn health_reports_only_minimal_status() {
         let app = build_router(build_state());
         let req = Request::builder()
             .uri("/health")
@@ -338,6 +338,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["status"], "ok");
+        assert_eq!(v.as_object().map(|o| o.len()), Some(1));
+        assert!(v.get("models").is_none());
+        assert!(v.get("apikeys").is_none());
+    }
+
+    #[tokio::test]
+    async fn health_rejects_non_get_requests() {
+        let app = build_router(build_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
