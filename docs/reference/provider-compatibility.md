@@ -10,8 +10,10 @@ The current provider set is:
 
 - `openai`
 - `anthropic`
-- `gemini`
+- `google`
 - `deepseek`
+- `cohere`
+- `jina`
 
 ## Compatibility Boundary
 

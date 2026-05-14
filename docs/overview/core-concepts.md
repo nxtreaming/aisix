@@ -22,8 +22,10 @@ The current provider enum includes:
 
 - `openai`
 - `anthropic`
-- `gemini`
+- `google`
 - `deepseek`
+- `cohere`
+- `jina`
 
 ## Provider Key
 
