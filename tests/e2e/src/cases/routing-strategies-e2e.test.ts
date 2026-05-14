@@ -129,13 +129,16 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
+    // Probing the virtual would warm the primary's cooldown
+    // (post-PR #268: every retryable upstream failure cools down the
+    // failing direct target) and zero out the per-target hit counts
+    // below. Instead, gate on the admin snapshot containing the
+    // virtual record — that proves the routing config has propagated
+    // to the DP without sending any traffic through the dispatcher.
     await waitConfigPropagation(async () => {
       try {
-        const probe = await client.chat.completions.create({
-          model: "routing-retry-virtual",
-          messages: [{ role: "user", content: "ready-routing-retry" }],
-        });
-        return probe.choices[0]?.message.content === "after retries";
+        const models = await admin!.listModels();
+        return models.some((m) => m.display_name === "routing-retry-virtual");
       } catch {
         return false;
       }
@@ -205,13 +208,14 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
+    // Gate on admin-snapshot presence rather than probing the
+    // virtual — probe would warm the primary's 429 cooldown and
+    // zero out per-target counts (post-PR #268: 429 cools down
+    // regardless of retry_on_429).
     await waitConfigPropagation(async () => {
       try {
-        const probe = await client.chat.completions.create({
-          model: "routing-429-virtual",
-          messages: [{ role: "user", content: "ready-routing-429" }],
-        });
-        return probe.choices[0]?.message.content === "429 fallback worked";
+        const models = await admin!.listModels();
+        return models.some((m) => m.display_name === "routing-429-virtual");
       } catch {
         return false;
       }
@@ -388,13 +392,15 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
+    // Gate on admin-snapshot presence rather than probing the
+    // virtual — probe would warm the weighted primary's 502 cooldown
+    // and skew per-target hit counts. Both direct models' readiness
+    // was already established above; this confirms the routing record
+    // has reached the DP snapshot.
     await waitConfigPropagation(async () => {
       try {
-        const probe = await client.chat.completions.create({
-          model: "routing-weighted-virtual",
-          messages: [{ role: "user", content: "ready-routing-weighted" }],
-        });
-        return probe.choices[0]?.message.content === "weighted fallback worked";
+        const models = await admin!.listModels();
+        return models.some((m) => m.display_name === "routing-weighted-virtual");
       } catch {
         return false;
       }

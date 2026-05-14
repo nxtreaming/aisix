@@ -180,29 +180,51 @@ async fn dispatch(
         .json(body)
         .send()
         .await
-        .map_err(|e| aisix_gateway::BridgeError::Transport(e.to_string()))
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                aisix_gateway::BridgeError::Transport(e.to_string()),
+            )
+        })
         .map_err(ProxyError::Bridge)?;
 
     let status = upstream_resp.status();
 
     if !status.is_success() {
         let status_u16 = status.as_u16();
+        let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
         let message = upstream_resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Bridge(
-            aisix_gateway::BridgeError::UpstreamStatus {
-                status: status_u16,
-                message: message.chars().take(1024).collect(),
-            },
-        ));
+        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
+            status_u16,
+            message.chars().take(1024).collect::<String>(),
+            retry_after,
+        );
+        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+        {
+            state
+                .runtime_status
+                .mark_cooldown(&model_entry.id, ttl, reason);
+        }
+        return Err(ProxyError::Bridge(err));
     }
 
     state.health.record_success(&model_name);
+    state.runtime_status.mark_healthy(&model_entry.id);
 
     let upstream_headers = upstream_resp.headers().clone();
     let body_bytes = upstream_resp
         .bytes()
         .await
-        .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+            )
+        })
         .map_err(ProxyError::Bridge)?;
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));

@@ -154,6 +154,7 @@ mod tests {
             retries: None,
             max_fallbacks,
             retry_on_429: None,
+            on_all_filtered: None,
         }
     }
 
@@ -412,31 +413,19 @@ mod tests {
     #[test]
     fn is_retryable_distinguishes_4xx_from_other_failures() {
         assert!(!is_retryable(
-            &BridgeError::UpstreamStatus {
-                status: 400,
-                message: "bad request".into(),
-            },
+            &BridgeError::upstream_status(400, "bad request"),
             false
         ));
         assert!(!is_retryable(
-            &BridgeError::UpstreamStatus {
-                status: 429,
-                message: "rate limited".into(),
-            },
+            &BridgeError::upstream_status(429, "rate limited"),
             false
         ));
         assert!(is_retryable(
-            &BridgeError::UpstreamStatus {
-                status: 429,
-                message: "rate limited".into(),
-            },
+            &BridgeError::upstream_status(429, "rate limited"),
             true
         ));
         assert!(is_retryable(
-            &BridgeError::UpstreamStatus {
-                status: 502,
-                message: "bad gateway".into(),
-            },
+            &BridgeError::upstream_status(502, "bad gateway"),
             false
         ));
         assert!(is_retryable(&BridgeError::Timeout { elapsed_ms: 1 }, false));
