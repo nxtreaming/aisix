@@ -521,9 +521,7 @@ async fn dispatch(
         let provider = crate::dispatch::require_provider(model).map_err(with_model)?;
         let pk_entry =
             crate::dispatch::resolve_provider_key(&snapshot, model).map_err(with_model)?;
-        let bridge = state
-            .hub
-            .get(provider)
+        let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
             .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
         let model_arc = Arc::new(model.clone());
         let pk_arc = Arc::new(pk_entry.value.clone());
@@ -814,7 +812,12 @@ async fn dispatch(
                 continue;
             }
         };
-        let Some(bridge) = state.hub.get(provider) else {
+        // Phase D cutover join point: try two-tier (specialized vendor
+        // → adapter family) first; fall back to the legacy
+        // Provider-keyed registry when the new fields aren't filled in
+        // on this PK yet. See crate::dispatch::resolve_bridge.
+        let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
+        else {
             last_err = Some(BridgeError::Config(
                 "no bridge registered for provider".into(),
             ));
