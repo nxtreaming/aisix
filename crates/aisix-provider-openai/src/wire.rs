@@ -9,6 +9,23 @@
 //! 2. deserialisation is strict where *we* read it (responses), loose
 //!    where *they* read it (requests) — i.e. we accept extra fields
 //!    from upstream but don't invent params.
+//!
+//! # Public surface
+//!
+//! The request/response/stream-chunk types and their conversion helpers
+//! are `pub` (not `pub(crate)`) because **sibling provider crates** in
+//! this workspace reuse them — Azure OpenAI Service's wire shape is
+//! literally OpenAI chat-completions, so the
+//! [`aisix-provider-azure-openai`](crate::aisix_provider_azure_openai)
+//! crate parses Azure responses through these same types (Azure's
+//! `prompt_filter_results` / `content_filter_results` extensions pass
+//! through because none of the types set `deny_unknown_fields`). Future
+//! OpenAI-compatible bridges (additional self-hosted endpoints, etc.)
+//! follow the same pattern. The visibility is **not a public-SDK
+//! stability promise**; it's an internal workspace contract. Embedding
+//! types stay `pub(crate)` because they're scoped to
+//! [`OpenAiBridge`](crate::OpenAiBridge) only until a sibling crate
+//! needs them.
 
 use aisix_gateway::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
@@ -17,7 +34,7 @@ use aisix_gateway::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiRequest<'a> {
+pub struct OpenAiRequest<'a> {
     pub model: &'a str,
     pub messages: &'a [OpenAiMessage<'a>],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,7 +49,7 @@ pub(crate) struct OpenAiRequest<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiMessage<'a> {
+pub struct OpenAiMessage<'a> {
     pub role: &'a str,
     /// `content` accepts string OR typed-block array per OpenAI's
     /// vision spec; we forward whichever the caller sent. The
@@ -60,7 +77,7 @@ pub(crate) struct OpenAiMessage<'a> {
 /// <https://platform.openai.com/docs/guides/vision>.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub(crate) enum OpenAiContent<'a> {
+pub enum OpenAiContent<'a> {
     Text(&'a str),
     Blocks(&'a [serde_json::Value]),
 }
@@ -69,7 +86,7 @@ pub(crate) enum OpenAiContent<'a> {
 ///
 /// `upstream_model` is the part after the `<provider>/` prefix from the
 /// Model entity (e.g. `"gpt-4o"`, not `"openai/gpt-4o"`).
-pub(crate) fn build_request<'a>(
+pub fn build_request<'a>(
     req: &'a ChatFormat,
     upstream_model: &'a str,
     messages: &'a [OpenAiMessage<'a>],
@@ -86,7 +103,7 @@ pub(crate) fn build_request<'a>(
     }
 }
 
-pub(crate) fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
+pub fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
     req.messages
         .iter()
         .map(|m| OpenAiMessage {
@@ -127,7 +144,7 @@ fn role_from_str(s: &str) -> Role {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiResponse {
+pub struct OpenAiResponse {
     pub id: String,
     pub model: String,
     pub choices: Vec<OpenAiChoice>,
@@ -136,14 +153,14 @@ pub(crate) struct OpenAiResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiChoice {
+pub struct OpenAiChoice {
     pub message: OpenAiResponseMessage,
     #[serde(default)]
     pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiResponseMessage {
+pub struct OpenAiResponseMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<String>,
@@ -152,7 +169,7 @@ pub(crate) struct OpenAiResponseMessage {
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct OpenAiUsage {
+pub struct OpenAiUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
@@ -168,14 +185,14 @@ pub(crate) struct OpenAiUsage {
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct OpenAiPromptDetails {
+pub struct OpenAiPromptDetails {
     /// Tokens served from the prompt cache (50% of prompt rate).
     #[serde(default)]
     pub cached_tokens: u32,
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct OpenAiCompletionDetails {
+pub struct OpenAiCompletionDetails {
     /// o1/o3 reasoning tokens. Same rate as `completion_tokens`,
     /// surfaced separately so admins can see "of which N were
     /// reasoning" on the dashboard.
@@ -183,7 +200,7 @@ pub(crate) struct OpenAiCompletionDetails {
     pub reasoning_tokens: u32,
 }
 
-pub(crate) fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
+pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
     let first = raw.choices.drain(..).next();
     let (message, finish) = match first {
         Some(c) => {
@@ -256,7 +273,7 @@ fn finish_reason(raw: Option<&str>) -> FinishReason {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiStreamChunk {
+pub struct OpenAiStreamChunk {
     pub id: String,
     pub model: String,
     pub choices: Vec<OpenAiStreamChoice>,
@@ -265,14 +282,14 @@ pub(crate) struct OpenAiStreamChunk {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiStreamChoice {
+pub struct OpenAiStreamChoice {
     pub delta: OpenAiStreamDelta,
     #[serde(default)]
     pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiStreamDelta {
+pub struct OpenAiStreamDelta {
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
@@ -289,7 +306,7 @@ pub(crate) struct OpenAiStreamDelta {
     pub reasoning_content: Option<String>,
 }
 
-pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
+pub fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
     let first = raw.choices.drain(..).next();
     let (delta, finish) = match first {
         Some(c) => (
