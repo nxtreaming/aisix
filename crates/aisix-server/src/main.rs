@@ -766,12 +766,20 @@ fn load_heartbeat_config_from_disk(
 /// Hub. The Hub is created once at startup; future dynamic reload
 /// lands behind the same `register()` call.
 ///
-/// `Provider::Cohere` and `Provider::Jina` are intentionally NOT
-/// registered: per #213 Phases 1–2 they are exposed only via
-/// `/v1/rerank`, which is a verbatim HTTP forward (`aisix-proxy::
-/// rerank`) and bypasses the Bridge trait entirely. A bridge for
-/// either provider would be needed only when chat completions /
-/// embeddings on those providers are added.
+/// `Provider::Jina` is intentionally NOT registered: per #213 Phase 2
+/// Jina is exposed only via `/v1/rerank`, which is a verbatim HTTP
+/// forward (`aisix-proxy::rerank`) and bypasses the Bridge trait
+/// entirely.
+///
+/// `Provider::Cohere` is registered against the OpenAI-compatible
+/// chat endpoint at `https://api.cohere.com/compatibility/v1` (per
+/// <https://docs.cohere.com/reference/chat>). Cohere's rerank surface
+/// at `/v1/rerank` continues to bypass the Bridge via
+/// `aisix-proxy::rerank` — the bridge here only serves `chat/completions`,
+/// `embeddings`, and the other OpenAI-shape endpoints the bridge
+/// supports. The chat-compat namespace gives an exact OpenAI envelope
+/// shape so `OpenAiBridge::with_name("cohere")` can serve it directly
+/// (closes #332).
 fn build_hub() -> Hub {
     let hub = Hub::new();
     hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
@@ -783,6 +791,10 @@ fn build_hub() -> Hub {
     hub.register(
         Provider::Deepseek,
         Arc::new(OpenAiBridge::new().with_name("deepseek")),
+    );
+    hub.register(
+        Provider::Cohere,
+        Arc::new(OpenAiBridge::new().with_name("cohere")),
     );
 
     // Family bridges (issue #302 Phase A/D two-tier dispatch). The
@@ -1074,5 +1086,40 @@ mod tests {
         let m = managed_with_urls(Some(""), None);
         let err = derive_cp_etcd_url(&m).unwrap_err();
         assert!(err.to_string().contains("cp_base_url"), "unexpected: {err}");
+    }
+
+    /// `build_hub()` must register `Provider::Cohere` against the
+    /// `with_name("cohere")` variant of [`OpenAiBridge`] — the only
+    /// thing that ties the Provider enum to the chat-compat URL
+    /// (closes #332). A regression that registered `OpenAiBridge::new()`
+    /// (default name = `"openai"`) or omitted the registration would
+    /// flip the bridge label on metrics and (more importantly) the
+    /// `default_base()` fallback, silently routing Cohere chat to
+    /// OpenAI's host.
+    #[test]
+    fn build_hub_registers_cohere_chat_compat_variant() {
+        let hub = build_hub();
+        let bridge = hub
+            .get(aisix_core::Provider::Cohere)
+            .expect("Provider::Cohere must have a Hub bridge registered for chat-compat");
+        assert_eq!(
+            bridge.name(),
+            "cohere",
+            "Hub.register(Provider::Cohere, …) MUST use OpenAiBridge::with_name(\"cohere\") — \
+             a `with_name(\"openai\")` fallback would route Cohere chat to OpenAI's host",
+        );
+    }
+
+    /// Companion to the cohere check above: Jina deliberately stays
+    /// rerank-only per #213 Phase 2. A future PR that flips Jina to
+    /// chat-compat must update this assertion deliberately.
+    #[test]
+    fn build_hub_does_not_register_jina_for_chat() {
+        let hub = build_hub();
+        assert!(
+            hub.get(aisix_core::Provider::Jina).is_none(),
+            "Provider::Jina is rerank-only (#213 Phase 2); a Hub registration here would \
+             silently route /v1/chat/completions on Jina to whichever bridge name was picked",
+        );
     }
 }
