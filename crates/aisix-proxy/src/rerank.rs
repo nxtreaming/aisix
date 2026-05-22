@@ -110,16 +110,18 @@ async fn dispatch(
 
     let model = &model_entry.value;
 
-    // Provider routing key, derived from `model.provider` as a
+    // Provider routing key, derived from `Model.provider` as a
     // lowercase string. Per #302 Phase A this dispatch path
-    // identifies Cohere/Jina by string rather than by `Provider`
-    // enum variant so that, when the `Provider` enum is later
-    // collapsed into the closed `Adapter` set, this file does not
-    // depend on variants (`Provider::Cohere`, `Provider::Jina`)
-    // that are slated for removal. The string values
-    // ("openai", "cohere", "jina") are the same labels emitted in
-    // metrics/access logs today, so dashboards keep working
-    // unchanged.
+    // identifies Cohere/Jina by their models.dev catalog id rather
+    // than by a closed enum variant — the `Provider` enum was
+    // collapsed into the open `ProviderKey.provider` string + the
+    // closed 5-value `Adapter` set used by `Hub::dispatch_two_tier`,
+    // but rerank's vendor-specific wire shape (Cohere/Jina each
+    // have a native rerank surface that bypasses the Bridge trait)
+    // doesn't fit either of those, so this path stays keyed on
+    // `Model.provider`. The string values ("openai", "cohere",
+    // "jina") are the same labels emitted in metrics/access logs
+    // today, so dashboards keep working unchanged.
     let provider_label = model
         .provider
         .clone()
@@ -251,13 +253,16 @@ async fn dispatch(
 }
 
 /// Default upstream host for the rerank-supporting providers,
-/// keyed by the lowercase provider string. Per #302 Phase A this
-/// is intentionally a string-keyed match (not a `Provider` enum
-/// match) so the file does not depend on `Provider::Cohere` /
-/// `Provider::Jina` variants that are slated for removal. The
-/// `{"openai", "cohere", "jina"}` set mirrors the rerank gate in
-/// `dispatch`; any other string returns `None` and the caller
-/// falls back to OpenAI's host.
+/// keyed by the lowercase `Model.provider` string. Per #302 Phase A
+/// this is a string-keyed match: the `Provider` enum has been
+/// replaced by `ProviderKey.adapter` (closed 5-value enum) +
+/// `ProviderKey.provider` (open string) for dispatch via
+/// `Hub::dispatch_two_tier`, but rerank's vendor-specific wire
+/// shapes (Cohere and Jina each have a native rerank surface) don't
+/// fit either of those, so this helper stays keyed on
+/// `Model.provider`. The `{"openai", "cohere", "jina"}` set mirrors
+/// the rerank gate in `dispatch`; any other string returns `None`
+/// and the caller falls back to OpenAI's host.
 fn default_base_for_provider(provider: &str) -> Option<String> {
     match provider {
         "openai" => Some("https://api.openai.com".to_string()),

@@ -42,8 +42,16 @@ pub struct ProviderKey {
     /// plaintext here.
     pub secret: String,
 
-    /// Override for the upstream base URL. Empty/None means the
-    /// provider default applies (see `Provider::default_base_url`).
+    /// Override for the upstream base URL. Empty/None is rejected by
+    /// every family bridge whose canonical-vendor identity doesn't
+    /// match the PK's `provider`: the OpenAI-family bridge refuses
+    /// to fall back to `api.openai.com` for a vendor other than
+    /// `"openai"`, and the Anthropic-family bridge refuses to fall
+    /// back to `api.anthropic.com` for a vendor other than
+    /// `"anthropic"`. See `OpenAiBridge::resolve_base` /
+    /// `AnthropicBridge::resolve_base` for the safety guards. cp-api
+    /// populates this from `adapter_map.yaml`'s `default_base_url` /
+    /// `provider_metadata.api_base_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
 
