@@ -20,7 +20,8 @@ use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    AccessLog, LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEvent, UsageLabels,
+    AccessLog, LlmUsage, Metrics, RequestLabels, RequestOutcome, RoutingAttemptEvent, UsageEvent,
+    UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -54,6 +55,65 @@ const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 struct AttemptModel {
     id: String,
     model: aisix_core::Model,
+}
+
+#[derive(Clone, Default)]
+struct RoutingTelemetry {
+    served_by_model: String,
+    attempt_count: u32,
+    fallback_count: u32,
+    attempts: Vec<RoutingAttemptEvent>,
+}
+
+impl RoutingTelemetry {
+    fn attempts_json(&self) -> Option<String> {
+        if self.attempts.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&self.attempts).ok()
+        }
+    }
+}
+
+struct DispatchFailure {
+    model_id: Option<String>,
+    charge: Option<UpstreamCharge>,
+    err: ProxyError,
+    routing: RoutingTelemetry,
+}
+
+impl DispatchFailure {
+    fn new(model_id: Option<String>, charge: Option<UpstreamCharge>, err: ProxyError) -> Self {
+        Self {
+            model_id,
+            charge,
+            err,
+            routing: RoutingTelemetry::default(),
+        }
+    }
+
+    fn with_routing(mut self, routing: RoutingTelemetry) -> Self {
+        self.routing = routing;
+        self
+    }
+}
+
+fn routing_error_class(err: &BridgeError) -> &'static str {
+    match err {
+        BridgeError::Timeout { .. } => "timeout",
+        BridgeError::UpstreamStatus { .. } => "upstream_status",
+        BridgeError::UpstreamDecode(_) => "upstream_decode",
+        BridgeError::Config(_) => "config",
+        BridgeError::Transport(_) => "transport",
+        BridgeError::StreamAborted => "stream_aborted",
+    }
+}
+
+fn routing_error_status(err: &BridgeError) -> Option<u16> {
+    match err {
+        BridgeError::UpstreamStatus { status, .. } => Some(*status),
+        _ => None,
+    }
 }
 
 // Per-attempt cooldown decision lives in `crate::cooldown` so every
@@ -90,6 +150,7 @@ pub async fn chat_completions(
                 &success,
                 elapsed,
             );
+            let routing_attempts_json = success.routing.attempts_json();
             emit_access_log(
                 method,
                 path,
@@ -102,6 +163,8 @@ pub async fn chat_completions(
                 success.completion_tokens,
                 success.total_tokens,
                 &request_id,
+                &success.routing,
+                routing_attempts_json.as_deref(),
             );
             // The streaming path wires telemetry into the SSE stream's
             // on_complete callback (it has to wait for the terminal
@@ -132,6 +195,7 @@ pub async fn chat_completions(
                         cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
                         cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
                         ttft_ms: 0,
+                        routing: success.routing.clone(),
                     },
                     success.cost_usd,
                     /* guardrail_blocked */ false,
@@ -187,7 +251,13 @@ pub async fn chat_completions(
             }
             success.response
         }
-        Err((resolved_model_id, charge, err)) => {
+        Err(failure) => {
+            let DispatchFailure {
+                model_id: resolved_model_id,
+                charge,
+                err,
+                routing,
+            } = failure;
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
             record_error(&state.metrics, &err, &model_name, status, elapsed);
@@ -204,6 +274,7 @@ pub async fn chat_completions(
                 ),
                 None => (None, None, None),
             };
+            let routing_attempts_json = routing.attempts_json();
             emit_access_log(
                 method,
                 path,
@@ -216,6 +287,8 @@ pub async fn chat_completions(
                 al_completion,
                 al_total,
                 &request_id,
+                &routing,
+                routing_attempts_json.as_deref(),
             );
             // Telemetry for the failure path. `resolved_model_id` is
             // populated by `dispatch` once the request's `req.model`
@@ -251,9 +324,16 @@ pub async fn chat_completions(
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
                         ttft_ms: 0,
+                        routing: c.routing,
                     },
                 ),
-                None => (0, 0, UsageExtras::default()),
+                None => {
+                    let extras = UsageExtras {
+                        routing,
+                        ..UsageExtras::default()
+                    };
+                    (0, 0, extras)
+                }
             };
             emit_usage_event(
                 &state,
@@ -340,17 +420,18 @@ struct Success {
     /// response header so callers can tell which target inside a
     /// routing group won the failover loop.
     ///
-    /// `None` in three cases:
+    /// `None` in two cases:
     ///   - Direct (non-routing) model — `display_name` of the served
     ///     target equals `req.model`, so the header would be redundant.
     ///   - Cache hit — we don't know which target produced the stored
     ///     response. Re-stamping a stale name would lie.
-    ///   - Streaming response from a routing group with no failover —
-    ///     the streaming path attempts only `targets[0]` (no mid-stream
-    ///     fallback), so the value would always be `targets[0]`. The
-    ///     header is set in that case below; this comment documents
-    ///     the policy, not an absence.
+    ///
+    /// Streaming routing responses still set this to the selected target.
+    /// The streaming path attempts only that target and does not fail over
+    /// mid-stream, but the header remains useful because callers asked for
+    /// the routing group's display name.
     served_by_target: Option<String>,
+    routing: RoutingTelemetry,
 }
 
 /// Cache decision attached to every successful request. Wire shape
@@ -484,6 +565,7 @@ struct UpstreamCharge {
     /// hits — without forwarding it on the output-block path the
     /// blocked-but-billed request is mis-bucketed as "no cache decision".
     cache_status: CacheStatus,
+    routing: RoutingTelemetry,
 }
 
 async fn dispatch(
@@ -492,9 +574,9 @@ async fn dispatch(
     req: &ChatFormat,
     request_id: &str,
     started: Instant,
-) -> Result<Success, (Option<String>, Option<UpstreamCharge>, ProxyError)> {
+) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
-        return Err((
+        return Err(DispatchFailure::new(
             None,
             None,
             ProxyError::InvalidRequest("messages array must not be empty".into()),
@@ -502,10 +584,9 @@ async fn dispatch(
     }
 
     let snapshot = state.snapshot.load();
-    let virtual_entry = snapshot
-        .models
-        .get_by_name(&req.model)
-        .ok_or_else(|| (None, None, ProxyError::ModelNotFound(req.model.clone())))?;
+    let virtual_entry = snapshot.models.get_by_name(&req.model).ok_or_else(|| {
+        DispatchFailure::new(None, None, ProxyError::ModelNotFound(req.model.clone()))
+    })?;
     let model_id = virtual_entry.id.clone();
 
     // Every error from here on attaches the resolved model_id so the
@@ -515,7 +596,7 @@ async fn dispatch(
     // they fire before any provider billing happens. The output-filter
     // path below is the only site that builds a `Some(UpstreamCharge)`
     // (manually, not via this helper).
-    let with_model = |e: ProxyError| (Some(model_id.clone()), None, e);
+    let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.clone()), None, e);
 
     if !auth.key().can_access(&req.model) {
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
@@ -656,10 +737,28 @@ async fn dispatch(
         let model_arc = Arc::new(model.clone());
         let pk_arc = Arc::new(pk_entry.value.clone());
         let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
-        let upstream = bridge
-            .chat_stream(req, &ctx)
-            .await
-            .map_err(|e| with_model(ProxyError::Bridge(e)))?;
+        let upstream = match bridge.chat_stream(req, &ctx).await {
+            Ok(upstream) => upstream,
+            Err(err) => {
+                let routing = if virtual_entry.value.routing.is_some() {
+                    RoutingTelemetry {
+                        served_by_model: String::new(),
+                        attempt_count: 1,
+                        fallback_count: 0,
+                        attempts: vec![RoutingAttemptEvent {
+                            model: model.display_name.clone(),
+                            attempt: 1,
+                            status: routing_error_status(&err),
+                            error: routing_error_class(&err).to_string(),
+                            success: false,
+                        }],
+                    }
+                } else {
+                    RoutingTelemetry::default()
+                };
+                return Err(with_model(ProxyError::Bridge(err)).with_routing(routing));
+            }
+        };
         // Drop the reservation now: concurrency releases on all layers.
         // RPM was already counted by pre_commit. TPM is updated
         // retroactively on stream-end by `add_tokens_post_stream`.
@@ -684,6 +783,23 @@ async fn dispatch(
         let provider_key_id_for_metrics = pk_entry.id.clone();
         let upstream_model_for_metrics = model.upstream_model().unwrap_or("unknown").to_string();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
+        let stream_routing = if virtual_entry.value.routing.is_some() {
+            RoutingTelemetry {
+                served_by_model: model.display_name.clone(),
+                attempt_count: 1,
+                fallback_count: 0,
+                attempts: vec![RoutingAttemptEvent {
+                    model: model.display_name.clone(),
+                    attempt: 1,
+                    status: Some(200),
+                    error: String::new(),
+                    success: true,
+                }],
+            }
+        } else {
+            RoutingTelemetry::default()
+        };
+        let stream_routing_for_telem = stream_routing.clone();
         // Per #204: pass the gateway's guardrail chain so the
         // streaming path can run output guardrails at end-of-stream
         // (buffer-then-check). Mirrors the non-streaming
@@ -757,6 +873,7 @@ async fn dispatch(
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
                         ttft_ms: comp.ttft_ms,
+                        routing: stream_routing_for_telem.clone(),
                     },
                     /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
@@ -836,6 +953,7 @@ async fn dispatch(
                 virtual_entry.value.routing.is_some(),
                 Some(model.display_name.clone()),
             ),
+            routing: stream_routing,
         });
     }
 
@@ -969,6 +1087,7 @@ async fn dispatch(
                     // target produced it on the original miss. See the
                     // `served_by_target` field docs on `Success`.
                     served_by_target: None,
+                    routing: RoutingTelemetry::default(),
                 });
             }
             Ok(None) => {}
@@ -1002,6 +1121,9 @@ async fn dispatch(
         .as_ref()
         .map(|routing| routing.retry_on_429_or_default())
         .unwrap_or(false);
+    let is_routing_request = virtual_entry.value.routing.is_some();
+    let mut routing = RoutingTelemetry::default();
+    let mut last_attempted_target: Option<String> = None;
 
     for attempt in &attempt_models {
         let model = &attempt.model;
@@ -1039,6 +1161,15 @@ async fn dispatch(
         let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
 
         for attempt_idx in 0..=retries {
+            if is_routing_request {
+                if let Some(prev) = last_attempted_target.as_deref() {
+                    if prev != model.display_name {
+                        routing.fallback_count += 1;
+                    }
+                }
+                last_attempted_target = Some(model.display_name.clone());
+                routing.attempt_count += 1;
+            }
             match bridge.chat(req, &ctx).await {
                 Ok(resp) => {
                     state.health.record_success(&model.display_name);
@@ -1048,10 +1179,29 @@ async fn dispatch(
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());
                     chosen_target_display_name = Some(model.display_name.clone());
+                    if is_routing_request {
+                        routing.served_by_model = model.display_name.clone();
+                        routing.attempts.push(RoutingAttemptEvent {
+                            model: model.display_name.clone(),
+                            attempt: (attempt_idx + 1) as u32,
+                            status: Some(200),
+                            error: String::new(),
+                            success: true,
+                        });
+                    }
                     upstream = Some(resp);
                     break;
                 }
                 Err(err) => {
+                    if is_routing_request {
+                        routing.attempts.push(RoutingAttemptEvent {
+                            model: model.display_name.clone(),
+                            attempt: (attempt_idx + 1) as u32,
+                            status: routing_error_status(&err),
+                            error: routing_error_class(&err).to_string(),
+                            success: false,
+                        });
+                    }
                     let retryable = is_retryable(&err, retry_on_429);
                     tracing::warn!(
                         target_model = %model.display_name,
@@ -1098,7 +1248,7 @@ async fn dispatch(
         let err = last_err.unwrap_or_else(|| {
             BridgeError::Config("routing exhausted with no targets attempted".into())
         });
-        return Err(with_model(ProxyError::Bridge(err)));
+        return Err(with_model(ProxyError::Bridge(err)).with_routing(routing));
     };
     let provider_name = chosen_provider.unwrap_or_else(|| "unknown".into());
     let provider_key_id = chosen_provider_key_id.unwrap_or_else(|| "unknown".into());
@@ -1154,6 +1304,7 @@ async fn dispatch(
                 finish_reason: finish_reason.clone(),
                 bypass_reason: bypass_reason.clone().unwrap_or_default(),
                 cache_status,
+                routing: routing.clone(),
             };
             // Per #153, the verdict's `reason` carries the matched-
             // pattern detail (the actual forbidden text from the
@@ -1168,11 +1319,12 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked response"
             );
-            return Err((
+            return Err(DispatchFailure::new(
                 Some(model_id.clone()),
                 Some(charge),
                 ProxyError::ContentFiltered("response blocked by content policy".into()),
-            ));
+            )
+            .with_routing(routing));
         }
         GuardrailVerdict::Bypass { reason } => {
             // First bypass wins — input bypass already populated
@@ -1246,6 +1398,7 @@ async fn dispatch(
         cache_hit_saved_output_tokens: 0,
         telemetry_handled_by_stream: false,
         served_by_target,
+        routing,
     })
 }
 
@@ -1473,6 +1626,10 @@ fn emit_usage_event(
         // /v1/rerank don't emit UsageEvents today; when they do they
         // also pass `"openai"` here.
         inbound_protocol: "openai".to_string(),
+        served_by_model: extras.routing.served_by_model,
+        routing_attempt_count: extras.routing.attempt_count,
+        routing_fallback_count: extras.routing.fallback_count,
+        routing_attempts: extras.routing.attempts,
     };
     state.usage_sink.try_emit(event.clone());
     // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is
@@ -1517,6 +1674,7 @@ struct UsageExtras {
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
     ttft_ms: u32,
+    routing: RoutingTelemetry,
 }
 
 fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {
@@ -1541,6 +1699,8 @@ fn emit_access_log(
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
     request_id: &str,
+    routing: &RoutingTelemetry,
+    routing_attempts: Option<&str>,
 ) {
     AccessLog {
         method,
@@ -1554,6 +1714,22 @@ fn emit_access_log(
         completion_tokens,
         total_tokens,
         request_id,
+        served_by_model: if routing.served_by_model.is_empty() {
+            None
+        } else {
+            Some(routing.served_by_model.as_str())
+        },
+        routing_attempt_count: if routing.attempt_count == 0 {
+            None
+        } else {
+            Some(routing.attempt_count)
+        },
+        routing_fallback_count: if routing.fallback_count == 0 {
+            None
+        } else {
+            Some(routing.fallback_count)
+        },
+        routing_attempts,
     }
     .emit();
 }
