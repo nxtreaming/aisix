@@ -92,15 +92,80 @@ impl VertexBridge {
         self
     }
 
-    /// Resolve the base host the bridge POSTs to. Production:
-    /// `https://<region>-aiplatform.googleapis.com`. Tests can pin
-    /// the host via [`Self::with_api_base_override`].
-    fn resolve_api_base(&self, region: &str) -> String {
+    /// Resolve the base host the bridge POSTs to.
+    ///
+    /// Precedence (highest first):
+    ///   1. `#[cfg(test)]` `Self::with_api_base_override` — test seam.
+    ///   2. `ProviderKey.api_base` — production override for
+    ///      corporate-proxy / private-VPC / mock deployments. The
+    ///      operator-supplied value is trimmed and any trailing `/`
+    ///      is stripped so `chat_gemini`'s URL stitching produces
+    ///      a single-slash separator.
+    ///   3. Canonical `https://<region>-aiplatform.googleapis.com`.
+    ///
+    /// Mirrors the Bedrock bridge's `endpoint_url` precedence
+    /// (`crates/aisix-provider-bedrock/src/bridge.rs::build_client_from_ctx`).
+    /// Fixes api7/ai-gateway#390 — pre-fix production builds
+    /// silently dropped `ProviderKey.api_base` for Vertex, so a BYO
+    /// operator's corporate-proxy URL was ignored.
+    ///
+    /// **Validation of `ProviderKey.api_base`** (PR #392 audit MEDIUM-1):
+    /// the operator-supplied override is interpolated directly into
+    /// the URL template, so we reject classes of input that the
+    /// bridge cannot safely concatenate or that would shadow auth:
+    ///   - non-`http(s)` schemes (no `file://`, `gs://`, etc.)
+    ///   - userinfo `@` (an operator embedding `user:pass@host` would
+    ///     leak credentials via logs / SSRF-style escalation)
+    ///   - `?` query string (would silently merge with the streaming
+    ///     `?alt=sse` the bridge appends)
+    ///   - `#` fragment (no meaningful semantic for an upstream POST)
+    ///
+    /// Mirrors the Azure-OpenAI sibling fix (#391) which rejects the
+    /// same classes. Errors surface as `BridgeError::Config` so the
+    /// operator sees an actionable message instead of a silent
+    /// fall-through-to-canonical (which is what the original #390 bug
+    /// was — exactly what we don't want to bring back).
+    fn resolve_api_base(
+        &self,
+        region: &str,
+        ctx_api_base: Option<&str>,
+    ) -> Result<String, BridgeError> {
         #[cfg(test)]
         if let Some(b) = &self.api_base_override {
-            return b.clone();
+            return Ok(b.clone());
         }
-        format!("https://{region}-aiplatform.googleapis.com")
+        if let Some(b) = ctx_api_base.map(str::trim).filter(|s| !s.is_empty()) {
+            if !(b.starts_with("https://") || b.starts_with("http://")) {
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must use http:// or https:// scheme, got {b:?}",
+                )));
+            }
+            if b.contains('@') {
+                // Redact userinfo before echoing the rejected value into
+                // the error string — the whole point of rejecting `@` is
+                // that operator-pasted credentials shouldn't appear in
+                // logs. Audit #392 re-audit LOW-1.
+                let redacted = redact_userinfo(b);
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must not embed userinfo (@); use the request's \
+                     Authorization header instead, got {redacted:?}",
+                )));
+            }
+            if b.contains('?') {
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must not contain a query string (the bridge \
+                     appends `?alt=sse` on streaming; an operator query would silently merge), \
+                     got {b:?}",
+                )));
+            }
+            if b.contains('#') {
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must not contain a fragment, got {b:?}",
+                )));
+            }
+            return Ok(b.trim_end_matches('/').to_string());
+        }
+        Ok(format!("https://{region}-aiplatform.googleapis.com"))
     }
 }
 
@@ -331,6 +396,35 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
 }
 
+/// Redact embedded userinfo from a URL string before echoing it
+/// into an error message. Specifically: `scheme://user:pass@host`
+/// becomes `scheme://<redacted>@host`. Only touches the substring
+/// between `://` and the first `@`; leaves the rest of the URL
+/// intact (including any other `@` in a path component). PR #392
+/// re-audit LOW-1.
+fn redact_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest_start = scheme_end + "://".len();
+    let rest = &url[rest_start..];
+    let Some(at_offset) = rest.find('@') else {
+        return url.to_string();
+    };
+    // Don't redact if the `@` is past the first path slash — that's
+    // RFC 3986 path syntax, not userinfo.
+    if let Some(slash_offset) = rest.find('/') {
+        if slash_offset < at_offset {
+            return url.to_string();
+        }
+    }
+    format!(
+        "{}://<redacted>@{}",
+        &url[..scheme_end],
+        &rest[at_offset + 1..],
+    )
+}
+
 /// Wrap a future in the optional deadline. `None` → no timeout.
 async fn with_deadline<T, F>(
     deadline: Option<Duration>,
@@ -486,7 +580,7 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region);
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
         let url = format!(
             "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent",
             project = creds.project,
@@ -566,7 +660,7 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region);
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
         let url = format!(
             "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent?alt=sse",
             project = creds.project,
@@ -1061,6 +1155,204 @@ mod tests {
         );
     }
 
+    // ─── resolve_api_base precedence ─────────────────────────────────
+    //
+    // Fixes api7/ai-gateway#391-companion (ai-gateway#390): pre-fix
+    // production builds hardcoded `https://<region>-aiplatform.googleapis.com`
+    // and silently ignored `ProviderKey.api_base`. The fix adds a
+    // `ctx_api_base: Option<&str>` arg with precedence:
+    //   #[cfg(test)] override > ctx_api_base > canonical region URL.
+
+    #[test]
+    fn resolve_api_base_honors_ctx_api_base_in_production_path() {
+        // Constructed without `with_api_base_override` so the test
+        // seam is None — exercises the production code path that
+        // pre-fix would have hit the canonical URL.
+        let bridge = VertexBridge::new();
+        let resolved = bridge
+            .resolve_api_base("us-central1", Some("http://mock-vertex:8001"))
+            .unwrap();
+        assert_eq!(resolved, "http://mock-vertex:8001");
+    }
+
+    #[test]
+    fn resolve_api_base_trims_trailing_slash_on_ctx_override() {
+        let bridge = VertexBridge::new();
+        let resolved = bridge
+            .resolve_api_base("us-central1", Some("http://x.example.internal/"))
+            .unwrap();
+        assert_eq!(
+            resolved, "http://x.example.internal",
+            "trailing slash must be stripped so URL stitching produces a single separator",
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_falls_back_to_canonical_on_empty_ctx_value() {
+        let bridge = VertexBridge::new();
+        // Empty string and whitespace-only values are treated as "no
+        // override" — fall through to the canonical region URL.
+        assert_eq!(
+            bridge.resolve_api_base("us-central1", Some("")).unwrap(),
+            "https://us-central1-aiplatform.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("us-central1", Some("   ")).unwrap(),
+            "https://us-central1-aiplatform.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("us-central1", None).unwrap(),
+            "https://us-central1-aiplatform.googleapis.com",
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_cfg_test_override_takes_precedence_over_ctx() {
+        // The test-only `with_api_base_override` seam shadows
+        // `ctx_api_base` so existing tests that pin against a
+        // wiremock URI keep working unchanged.
+        let bridge = VertexBridge::new().with_api_base_override("http://wiremock:9999");
+        let resolved = bridge
+            .resolve_api_base("us-central1", Some("http://ignored-ctx:8001"))
+            .unwrap();
+        assert_eq!(resolved, "http://wiremock:9999");
+    }
+
+    // ─── SSRF / credential-embed validation of api_base (PR #392 audit M1) ──
+    //
+    // The operator-supplied api_base is interpolated directly into
+    // `format!("{base}/v1/projects/...")`. The bridge rejects classes
+    // of input that would either escalate (userinfo `@`) or silently
+    // corrupt the URL stitching (`?` / `#`). Mirrors the Azure-OpenAI
+    // sibling fix (#391) which rejects the same shapes.
+
+    #[test]
+    fn resolve_api_base_rejects_non_http_scheme() {
+        let bridge = VertexBridge::new();
+        for bad in [
+            "file:///etc/passwd",
+            "gs://my-bucket/path",
+            "ftp://internal.example",
+            // bare host without scheme — operator might paste this
+            // expecting the bridge to add https://, but it won't.
+            "mock-vertex:8001",
+            "//mock-vertex:8001",
+        ] {
+            let err = bridge
+                .resolve_api_base("us-central1", Some(bad))
+                .err()
+                .unwrap_or_else(|| panic!("expected error for api_base={bad:?}"));
+            match err {
+                BridgeError::Config(msg) => {
+                    assert!(
+                        msg.contains("http"),
+                        "error message should name the http(s) requirement; got: {msg}"
+                    );
+                }
+                other => panic!("expected Config error for api_base={bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_api_base_rejects_embedded_userinfo() {
+        let bridge = VertexBridge::new();
+        // userinfo (`user:pass@host`) is rejected because:
+        //   1. it would leak credentials via access-log URLs;
+        //   2. the bridge writes its own Authorization header from
+        //      the SA-minted Bearer; userinfo would either shadow it
+        //      or get sent to a non-Google host.
+        let err = bridge
+            .resolve_api_base("us-central1", Some("https://user:secret@proxy.internal"))
+            .err()
+            .unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("userinfo") || msg.contains("@"));
+                // Defense-in-depth: the error message MUST NOT echo
+                // the original userinfo back into log output (re-audit
+                // LOW-1). The redactor replaces `user:secret` with
+                // `<redacted>` so an operator-supplied credential
+                // doesn't propagate into operational telemetry.
+                assert!(
+                    !msg.contains("user:secret"),
+                    "error message leaked operator-supplied userinfo: {msg}"
+                );
+                assert!(
+                    msg.contains("<redacted>"),
+                    "error message should redact userinfo: {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redact_userinfo_strips_user_and_password() {
+        assert_eq!(
+            redact_userinfo("https://user:secret@proxy.internal"),
+            "https://<redacted>@proxy.internal",
+        );
+        assert_eq!(
+            redact_userinfo("http://just-user@host:8001/path"),
+            "http://<redacted>@host:8001/path",
+        );
+    }
+
+    #[test]
+    fn redact_userinfo_leaves_non_userinfo_at_alone() {
+        // `@` past the first path slash is NOT userinfo per RFC 3986.
+        assert_eq!(
+            redact_userinfo("https://proxy.internal/v1@my-namespace"),
+            "https://proxy.internal/v1@my-namespace",
+        );
+        // No scheme → unchanged.
+        assert_eq!(
+            redact_userinfo("proxy.internal@path"),
+            "proxy.internal@path"
+        );
+        // No `@` at all → unchanged.
+        assert_eq!(
+            redact_userinfo("https://proxy.internal/x"),
+            "https://proxy.internal/x"
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_rejects_query_string() {
+        let bridge = VertexBridge::new();
+        // Streaming path appends `?alt=sse`; an operator query would
+        // silently merge with that and produce a broken URL.
+        let err = bridge
+            .resolve_api_base(
+                "us-central1",
+                Some("https://proxy.internal?api-version=oops"),
+            )
+            .err()
+            .unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("query") || msg.contains('?'));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_api_base_rejects_fragment() {
+        let bridge = VertexBridge::new();
+        let err = bridge
+            .resolve_api_base("us-central1", Some("https://proxy.internal#fragment"))
+            .err()
+            .unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("fragment") || msg.contains('#'));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn publisher_case_insensitive_on_model_name() {
         assert_eq!(
@@ -1445,6 +1737,20 @@ mod tests {
         )
     }
 
+    /// Variant that sets `api_base` on the ProviderKey — exercises
+    /// the production-path override introduced by #390 without
+    /// touching the test-only `with_api_base_override` seam.
+    fn sample_pk_with_secret_and_api_base(secret_json: &str, api_base: &str) -> Arc<ProviderKey> {
+        Arc::new(
+            serde_json::from_str(&format!(
+                r#"{{"display_name": "vertex-prod", "secret": {}, "api_base": {}}}"#,
+                serde_json::to_string(secret_json).unwrap(),
+                serde_json::to_string(api_base).unwrap(),
+            ))
+            .unwrap(),
+        )
+    }
+
     fn valid_secret_json() -> &'static str {
         r#"{"access_token":"ya29.test","project":"my-proj","region":"us-central1"}"#
     }
@@ -1655,6 +1961,71 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.message.content, "hello from gemini");
         assert_eq!(chat.usage.total_tokens, 6);
+    }
+
+    /// End-to-end production-path coverage for api7/ai-gateway#390:
+    /// drive the bridge with `ProviderKey.api_base` set (and NO
+    /// `with_api_base_override`), assert the bridge actually POSTs
+    /// to the operator-supplied host. Pre-fix this would have hit
+    /// the canonical `<region>-aiplatform.googleapis.com` URL, the
+    /// wiremock would observe zero requests, and `.expect(1)` would
+    /// surface the bug.
+    #[tokio::test]
+    async fn chat_gemini_honors_provider_key_api_base_in_production_path() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .respond_with(responder.clone())
+            .expect(1) // pre-fix: 0 (traffic went to canonical Google URL); post-fix: 1
+            .mount(&server)
+            .await;
+
+        // Production path: NO `with_api_base_override`; the URL must
+        // be driven entirely by `ProviderKey.api_base`.
+        let bridge = VertexBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret_and_api_base(valid_secret_json(), &server.uri()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.message.content, "hello from gemini");
+    }
+
+    /// Same as above but exercises the trailing-slash trim — a
+    /// realistic operator paste (`http://corp-proxy/vertex/`) must
+    /// still produce a single-slash URL after concatenation.
+    #[tokio::test]
+    async fn chat_gemini_trims_trailing_slash_on_provider_key_api_base() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new();
+        // Note: server.uri() typically has no trailing slash; append one.
+        let api_base_with_slash = format!("{}/", server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret_and_api_base(valid_secret_json(), &api_base_with_slash),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        // Body shape unaffected — the assertion is the wiremock's
+        // `expect(1)` on the exact path (no `//` doubling).
+        assert_eq!(chat.message.content, "hello from gemini");
     }
 
     #[tokio::test]
@@ -2179,6 +2550,48 @@ mod tests {
             chunks.push(item.unwrap());
         }
         assert!(!chunks.is_empty(), "expected at least one chunk");
+    }
+
+    /// Streaming-path counterpart to
+    /// `chat_gemini_honors_provider_key_api_base_in_production_path`
+    /// (PR #392 audit HIGH-1). Pre-fix, `chat_gemini_stream` also
+    /// hardcoded the canonical Google URL; this test pins that the
+    /// production path of the streaming bridge follows `ProviderKey.api_base`
+    /// without the test-only `with_api_base_override` seam.
+    #[tokio::test]
+    async fn chat_gemini_stream_honors_provider_key_api_base_in_production_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:streamGenerateContent",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(happy_path_sse_body()),
+            )
+            .expect(1) // pre-fix: 0 (canonical Google host); post-fix: 1.
+            .mount(&server)
+            .await;
+
+        // Production path: NO `with_api_base_override`; the URL must
+        // be driven entirely by `ProviderKey.api_base`.
+        let bridge = VertexBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret_and_api_base(valid_secret_json(), &server.uri()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        assert!(
+            !chunks.is_empty(),
+            "expected at least one chunk via ctx-driven URL"
+        );
     }
 
     #[tokio::test]
