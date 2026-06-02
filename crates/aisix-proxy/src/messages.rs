@@ -255,11 +255,13 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    // Arc so the chain can be cloned into the streaming-response body
+    // (which outlives this handler) for end-of-stream output guardrails.
+    let resolved_chain = std::sync::Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
     if !resolved_chain.is_empty() {
         if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
             if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-                aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+                aisix_guardrails::Guardrail::check_input(resolved_chain.as_ref(), &chat).await
             {
                 tracing::warn!(
                     guardrail_hook = "input",
@@ -322,6 +324,7 @@ async fn dispatch(
             &auth.entry.id,
             auth.key().team_id.clone(),
             auth.key().user_id.clone(),
+            resolved_chain.clone(),
         )
         .await;
     }
@@ -343,6 +346,7 @@ async fn dispatch(
             &auth.entry.id,
             auth.key().team_id.clone(),
             auth.key().user_id.clone(),
+            resolved_chain.clone(),
         )
         .await
         {
@@ -377,6 +381,7 @@ async fn dispatch_to_target(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -394,6 +399,7 @@ async fn dispatch_to_target(
             api_key_id,
             team_id,
             user_id,
+            resolved_chain,
         )
         .await;
     }
@@ -411,6 +417,7 @@ async fn dispatch_to_target(
         api_key_id,
         team_id,
         user_id,
+        resolved_chain,
     )
     .await
 }
@@ -433,6 +440,7 @@ async fn anthropic_passthrough_dispatch(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
     let api_key = crate::dispatch::require_secret(pk_value, model)?;
@@ -595,8 +603,17 @@ async fn anthropic_passthrough_dispatch(
         let team_id_c = team_id.clone();
         let user_id_c = user_id.clone();
 
-        let parsed_stream =
-            build_anthropic_passthrough_stream(body_stream, started, move |usage| {
+        let stream_guardrail = if resolved_chain.is_empty() {
+            None
+        } else {
+            Some(resolved_chain.clone())
+        };
+        let parsed_stream = build_anthropic_passthrough_stream(
+            body_stream,
+            started,
+            stream_guardrail,
+            model_name.to_string(),
+            move |usage| {
                 // Streaming responses that got this far are 200 — the
                 // !status.is_success() guard above returned early on
                 // upstream errors.
@@ -625,7 +642,8 @@ async fn anthropic_passthrough_dispatch(
                     started.elapsed(),
                     metrics,
                 );
-            });
+            },
+        );
 
         let mut response =
             axum::response::Response::new(axum::body::Body::from_stream(parsed_stream));
@@ -682,6 +700,49 @@ async fn anthropic_passthrough_dispatch(
             .map_err(ProxyError::Bridge)?;
 
         let metrics = anthropic_metrics_from_response_json(&json_body);
+
+        // #448 (#22): run output guardrails on the passthrough response.
+        // The body is forwarded verbatim, so extract its text (content
+        // blocks + the raw content array, which covers tool_use args) into
+        // a synthetic ChatResponse for inspection before returning it.
+        if !resolved_chain.is_empty() {
+            if let Some(content) = json_body.get("content").and_then(|v| v.as_array()) {
+                let mut out_text = String::new();
+                for block in content {
+                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                        if !out_text.is_empty() {
+                            out_text.push('\n');
+                        }
+                        out_text.push_str(t);
+                    }
+                }
+                if !out_text.is_empty() {
+                    out_text.push('\n');
+                }
+                out_text.push_str(&Value::Array(content.clone()).to_string());
+
+                let synth = aisix_gateway::ChatResponse {
+                    id: String::new(),
+                    model: model_name.to_string(),
+                    message: aisix_gateway::ChatMessage::assistant(out_text),
+                    finish_reason: aisix_gateway::FinishReason::Stop,
+                    usage: aisix_gateway::UsageStats::new(0, 0),
+                };
+                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                    aisix_guardrails::Guardrail::check_output(resolved_chain.as_ref(), &synth).await
+                {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_name,
+                        reason = %reason,
+                        "guardrail blocked /v1/messages passthrough response",
+                    );
+                    return Err(ProxyError::ContentFiltered(
+                        "response blocked by content policy".into(),
+                    ));
+                }
+            }
+        }
 
         // Restore the gateway-facing model name so callers see what they asked for.
         let mut json_body = json_body;
@@ -770,6 +831,7 @@ async fn cross_provider_dispatch(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
@@ -847,33 +909,45 @@ async fn cross_provider_dispatch(
         let team_id_for_telem = team_id;
         let user_id_for_telem = user_id;
         let started_for_telem = started;
-        let sse_body = build_anthropic_sse_stream(upstream, encoder, started, move |comp| {
-            let metrics = AnthropicUsageMetrics {
-                prompt_tokens: comp.prompt_tokens,
-                completion_tokens: comp.completion_tokens,
-                cache_creation_tokens: comp.cache_creation_tokens,
-                cache_read_tokens: comp.cache_read_tokens,
-                provider_request_id: comp.provider_request_id,
-                provider_model_version: comp.provider_model_version,
-                finish_reason: comp.finish_reason,
-                ttft_ms: comp.ttft_ms,
-            };
-            emit_anthropic_usage_event(
-                &state_for_telem,
-                &request_id_for_telem,
-                &model_id_for_telem,
-                &api_key_id_for_telem,
-                &provider_for_telem,
-                &model_for_telem,
-                &provider_key_id_for_telem,
-                &upstream_model_for_telem,
-                team_id_for_telem.as_deref(),
-                user_id_for_telem.as_deref(),
-                200,
-                started_for_telem.elapsed(),
-                metrics,
-            );
-        });
+        let stream_guardrail = if resolved_chain.is_empty() {
+            None
+        } else {
+            Some(resolved_chain.clone())
+        };
+        let sse_body = build_anthropic_sse_stream(
+            upstream,
+            encoder,
+            started,
+            stream_guardrail,
+            model_name.to_string(),
+            move |comp| {
+                let metrics = AnthropicUsageMetrics {
+                    prompt_tokens: comp.prompt_tokens,
+                    completion_tokens: comp.completion_tokens,
+                    cache_creation_tokens: comp.cache_creation_tokens,
+                    cache_read_tokens: comp.cache_read_tokens,
+                    provider_request_id: comp.provider_request_id,
+                    provider_model_version: comp.provider_model_version,
+                    finish_reason: comp.finish_reason,
+                    ttft_ms: comp.ttft_ms,
+                };
+                emit_anthropic_usage_event(
+                    &state_for_telem,
+                    &request_id_for_telem,
+                    &model_id_for_telem,
+                    &api_key_id_for_telem,
+                    &provider_for_telem,
+                    &model_for_telem,
+                    &provider_key_id_for_telem,
+                    &upstream_model_for_telem,
+                    team_id_for_telem.as_deref(),
+                    user_id_for_telem.as_deref(),
+                    200,
+                    started_for_telem.elapsed(),
+                    metrics,
+                );
+            },
+        );
 
         let mut response = axum::response::Response::new(sse_body);
         response.headers_mut().insert(
@@ -910,6 +984,25 @@ async fn cross_provider_dispatch(
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
+    // #448 (#22): run output guardrails on the cross-provider response
+    // before rendering it back as Anthropic JSON — the response is
+    // client-visible output just like /v1/chat/completions.
+    if !resolved_chain.is_empty() {
+        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+            aisix_guardrails::Guardrail::check_output(resolved_chain.as_ref(), &resp).await
+        {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/messages response",
+            );
+            return Err(ProxyError::ContentFiltered(
+                "response blocked by content policy".into(),
+            ));
+        }
+    }
+
     let metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,
         completion_tokens: resp.usage.completion_tokens,
@@ -940,6 +1033,8 @@ fn build_anthropic_sse_stream(
     upstream: aisix_gateway::ChatChunkStream,
     encoder: aisix_provider_anthropic::AnthropicSseEncoder,
     started: Instant,
+    output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
+    model_label: String,
     on_complete: impl FnOnce(AnthropicStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
@@ -951,6 +1046,16 @@ fn build_anthropic_sse_stream(
         };
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
+        // Accumulate assistant text for the end-of-stream output guardrail
+        // (#448). Bytes are forwarded live (mirrors /v1/chat/completions and
+        // LiteLLM's streaming guardrail), so a blocked response is signalled
+        // with a terminal `error` event rather than held back.
+        let mut content_text = String::new();
+        // Also collect streamed tool-call fragments so tool-call output is
+        // scanned too (parity with the non-streaming path). Fragments are
+        // kept raw — the guardrail scans their serialized text, no need to
+        // reassemble by index.
+        let mut tool_call_fragments: Vec<serde_json::Value> = Vec::new();
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
@@ -978,6 +1083,14 @@ fn build_anthropic_sse_stream(
                             comp.cache_creation_tokens.max(u.cache_creation_tokens);
                         comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
                     }
+                    if output_guardrail.is_some() {
+                        if let Some(t) = chunk.delta.content.as_deref() {
+                            content_text.push_str(t);
+                        }
+                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                            tool_call_fragments.extend(tcs.iter().cloned());
+                        }
+                    }
                     for ev in encoder.next_events(&chunk) {
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
                     }
@@ -991,6 +1104,43 @@ fn build_anthropic_sse_stream(
                         e.error_type(),
                         serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into()),
                     );
+                    yield Ok(bytes::Bytes::from(frame));
+                    return;
+                }
+            }
+        }
+        // End-of-stream output guardrail (#448): scan the accumulated
+        // assistant text and, on a block, emit a terminal Anthropic
+        // `error` event instead of completing the stream cleanly.
+        if let Some(chain) = output_guardrail.as_ref() {
+            if !content_text.is_empty() || !tool_call_fragments.is_empty() {
+                let mut message =
+                    aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text));
+                if !tool_call_fragments.is_empty() {
+                    // guardrail_output_text() serializes extra["tool_calls"],
+                    // so streamed tool-call arguments are scanned too.
+                    message.extra.insert(
+                        "tool_calls".to_string(),
+                        serde_json::Value::Array(std::mem::take(&mut tool_call_fragments)),
+                    );
+                }
+                let synth = aisix_gateway::ChatResponse {
+                    id: String::new(),
+                    model: model_label.clone(),
+                    message,
+                    finish_reason: aisix_gateway::FinishReason::Stop,
+                    usage: aisix_gateway::UsageStats::new(0, 0),
+                };
+                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                    aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
+                {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_label,
+                        reason = %reason,
+                        "guardrail blocked streaming /v1/messages response",
+                    );
+                    let frame = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"content_filter\",\"message\":\"response blocked by content policy\"}}\n\n";
                     yield Ok(bytes::Bytes::from(frame));
                     return;
                 }
@@ -1221,6 +1371,9 @@ struct AnthropicStreamUsage {
     /// Count of upstream byte-chunks actually delivered to the client
     /// (read by the Drop guard for the #419 cost-leak gate).
     chunks_delivered: u32,
+    /// Assistant text accumulated from `content_block_delta` frames, for
+    /// the end-of-stream output guardrail (#448).
+    response_text: String,
 }
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
@@ -1268,6 +1421,32 @@ fn update_anthropic_usage(
             if !*first_token_seen {
                 *first_token_seen = true;
                 acc.ttft_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            }
+            // Accumulate assistant output for the end-of-stream output
+            // guardrail (#448). text streams as `delta.text`; tool_use
+            // streams its name in `content_block.{name,input}` on
+            // content_block_start and its arguments as `delta.partial_json`
+            // on input_json_delta — scan all of it.
+            if let Some(delta) = json.get("delta") {
+                if let Some(t) = delta.get("text").and_then(Value::as_str) {
+                    acc.response_text.push('\n');
+                    acc.response_text.push_str(t);
+                }
+                if let Some(pj) = delta.get("partial_json").and_then(Value::as_str) {
+                    acc.response_text.push_str(pj);
+                }
+            }
+            if let Some(cb) = json.get("content_block") {
+                if let Some(name) = cb.get("name").and_then(Value::as_str) {
+                    acc.response_text.push('\n');
+                    acc.response_text.push_str(name);
+                }
+                if let Some(input) = cb.get("input") {
+                    if !input.is_null() {
+                        acc.response_text.push('\n');
+                        acc.response_text.push_str(&input.to_string());
+                    }
+                }
             }
         }
         Some("message_delta") => {
@@ -1427,6 +1606,8 @@ impl<T> Stream for AnthropicDeliveryCounter<T> {
 fn build_anthropic_passthrough_stream<S, F>(
     upstream: S,
     started: Instant,
+    output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
+    model_label: String,
     on_complete: F,
 ) -> AnthropicDeliveryCounter<reqwest::Result<Bytes>>
 where
@@ -1482,6 +1663,34 @@ where
             // upstream error mid-stream is passed through; the
             // accumulator keeps whatever was captured before it).
             yield item;
+        }
+        // End-of-stream output guardrail (#448): scan the accumulated
+        // assistant text. On a block, emit a terminal Anthropic `error`
+        // event (bytes were already forwarded verbatim, mirroring the
+        // cross-provider path and LiteLLM's streaming guardrail).
+        if let Some(chain) = output_guardrail.as_ref() {
+            let text = std::mem::take(&mut guard.usage().response_text);
+            if !text.is_empty() {
+                let synth = aisix_gateway::ChatResponse {
+                    id: String::new(),
+                    model: model_label.clone(),
+                    message: aisix_gateway::ChatMessage::assistant(text),
+                    finish_reason: aisix_gateway::FinishReason::Stop,
+                    usage: aisix_gateway::UsageStats::new(0, 0),
+                };
+                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                    aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
+                {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_label,
+                        reason = %reason,
+                        "guardrail blocked streaming /v1/messages passthrough response",
+                    );
+                    let frame = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"content_filter\",\"message\":\"response blocked by content policy\"}}\n\n";
+                    yield Ok(Bytes::from(frame));
+                }
+            }
         }
         // guard drops here → on_complete fires (delivery-gated).
     };
