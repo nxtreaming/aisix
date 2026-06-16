@@ -44,6 +44,32 @@ jobs:
             exit 1
           fi
 
+  openapi-generate:
+    name: generate admin openapi
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: generate Admin API OpenAPI
+        run: |
+          cargo run -p aisix-admin --bin dump-openapi > /tmp/admin-api.openapi.json
+      - name: validate generated OpenAPI
+        run: |
+          python3 - <<'PY'
+          import json
+
+          with open("/tmp/admin-api.openapi.json") as f:
+              spec = json.load(f)
+
+          assert spec["openapi"].startswith("3.")
+          assert spec["info"]["title"] == "AISIX Admin API"
+          assert spec["info"]["version"] == "dev"
+          assert "/admin/v1/models" in spec["paths"]
+          assert "Model" in spec["components"]["schemas"]
+          PY
+
   rust-unit:
     name: rust unit + coverage
     runs-on: ubicloud-standard-2

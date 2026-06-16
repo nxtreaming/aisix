@@ -58,20 +58,35 @@ re-run:
 cargo run -p aisix-core --bin dump-schema
 ```
 
-CI runs the same command and fails the build if `schemas/` drifts from
-the Rust types (drift-check workflow, separate PR).
+After modifying Admin API routes, OpenAPI metadata, or the generated
+resource schemas, verify that the Admin API OpenAPI generator still
+emits a valid document:
+
+```bash
+cargo run -p aisix-admin --bin dump-openapi > /tmp/admin-api.openapi.json
+```
+
+CI runs the resource-schema drift check and the Admin API OpenAPI
+generation check.
+
+Release builds publish the Admin API OpenAPI document to
+`/ai-gateway/openapi-<version>.json` and `/ai-gateway/openapi-latest.json`
+on the configured `run.api7.ai` bucket. Main-branch builds publish
+`/ai-gateway/openapi-dev.json` when the S3 and CloudFront secrets are
+configured in the repository.
 
 ## Downstream consumers
 
 - `crates/aisix-admin/src/openapi.rs` — DP admin OpenAPI 3.1 document.
   Refactor target: replace inline schema objects with `$ref` into these
   files. (Follow-up PR.)
-- `api7/AISIX-Cloud` cp-api — pulls these files (via submodule or
-  pinned tag) for REST input validation against the same shape DP
-  consumes from etcd.
-- `api7/AISIX-Cloud` dashboard — renders forms straight from these
-  schemas with [RJSF](https://github.com/rjsf-team/react-jsonschema-form)
-  or equivalent, instead of hand-coded validators.
+- Documentation sites can consume the hosted Admin API OpenAPI document
+  for the AISIX AI Gateway Admin API reference.
+- Control-plane services can pin these files for REST input validation
+  against the same shape the data plane consumes from etcd.
+- Dashboards can render forms from these schemas with
+  [RJSF](https://github.com/rjsf-team/react-jsonschema-form) or
+  equivalent, instead of hand-coded validators.
 
 Refs api7/ai-gateway#304 item #1 (canonical JSON Schema as config
 source of truth).
