@@ -41,18 +41,16 @@ pub struct ApiKey {
     #[schemars(length(min = 1))]
     pub user_id: Option<String>,
 
-    /// Readable display name of the owning member (#890 req-3). Synced by
-    /// cp-api solely so the proxy can stamp a human-readable `user_name`
-    /// metric label alongside `user_id`; never used for auth or routing.
-    /// Absent on older cp-api payloads → the metric label falls back to
-    /// `"unknown"` (DP-first rollout).
+    /// Readable display name of the owning member. Used only for telemetry
+    /// labels alongside `user_id`; never used for authentication or routing.
+    /// When omitted, telemetry reports the user name as `"unknown"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
 
     /// MCP tools this key may call, as namespaced `<server>__<tool>` names
     /// (the form the gateway exposes). A wildcard entry `"*"` grants every
-    /// tool. When omitted, the key has no MCP tool access — access is granted
-    /// explicitly, matching `allowed_models`.
+    /// tool. When omitted or set to `null`, the key has no MCP tool access —
+    /// access is granted explicitly, matching `allowed_models`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
 
@@ -199,6 +197,12 @@ mod tests {
         let none: ApiKey =
             serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
         assert!(!none.can_access_tool("github__create_issue"));
+
+        // Explicit null has the same no-access behavior as omission.
+        let null: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"],"allowed_tools":null}"#)
+                .unwrap();
+        assert!(!null.can_access_tool("github__create_issue"));
 
         // Empty list also denies everything.
         let empty: ApiKey =

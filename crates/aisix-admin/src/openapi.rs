@@ -3163,6 +3163,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "rate_limit": {
             "$ref": "#/components/schemas/RateLimit",
             "description": "Request, token, and concurrency limits for this key."
+          },
+          "allowed_tools": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted or set to `null`, the key has no MCP tool access."
           }
         },
         "additionalProperties": false
@@ -3461,6 +3471,19 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "rate_limit": {
             "$ref": "#/components/schemas/RateLimit",
             "description": "Request, token, and concurrency limits for this key."
+          },
+          "allowed_tools": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted or set to `null`, the key has no MCP tool access.",
+            "example": [
+              "github__create_issue"
+            ]
           }
         },
         "additionalProperties": false,
@@ -3703,7 +3726,7 @@ fn add_variant_titles(doc: &mut Value) {
         ),
         (
             "/components/schemas/WhenAllUnavailablePolicy/oneOf",
-            &["Fail", "Original order"],
+            &["Fail", "Try anyway"],
         ),
         (
             "/components/schemas/RoutingStrategy/oneOf",
@@ -4158,6 +4181,29 @@ mod tests {
         let request = &parsed["components"]["schemas"]["ApiKeyRequest"];
         assert_eq!(request["required"][0], "key_hash");
         assert_eq!(request["required"][1], "allowed_models");
+        assert!(
+            request["properties"].get("allowed_tools").is_some(),
+            "self-hosted API key requests must document MCP tool access"
+        );
+        let request_allowed_tools = request["properties"]["allowed_tools"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            request_allowed_tools.contains("omitted or set to `null`"),
+            "self-hosted API key request schema must document null tool-access behavior"
+        );
+        let public = &parsed["components"]["schemas"]["PublicApiKey"];
+        assert!(
+            public["properties"].get("allowed_tools").is_some(),
+            "API key responses must document MCP tool access"
+        );
+        let public_allowed_tools = public["properties"]["allowed_tools"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            public_allowed_tools.contains("omitted or set to `null`"),
+            "API key response schema must document null tool-access behavior"
+        );
         assert!(request["properties"].get("team_id").is_none());
         assert!(request["properties"].get("user_id").is_none());
     }
