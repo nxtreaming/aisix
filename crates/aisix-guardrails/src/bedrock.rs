@@ -16,7 +16,8 @@
 //! | Bedrock response                | `fail_open` | Verdict                        |
 //! |---------------------------------|-------------|--------------------------------|
 //! | `action=NONE`                   | n/a         | Allow                          |
-//! | `action=GUARDRAIL_INTERVENED`   | n/a         | Block { reason }               |
+//! | intervened, hard block          | n/a         | Block { reason }               |
+//! | intervened, ANONYMIZED only     | n/a         | masked write-back on the segment path (`moderate_*_segments`); Block on the blob path (`check_*`, no write-back channel) |
 //! | 5xx / IO error                  | true        | Bypass { "bedrock_5xx" }       |
 //! | 5xx / IO error                  | false       | Block { "bedrock unavailable" } |
 //! | timeout (`latency_mode=timed`)  | true        | Bypass { "bedrock_timeout" }   |
@@ -38,15 +39,18 @@ use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Region};
-use aws_sdk_bedrockruntime::operation::apply_guardrail::ApplyGuardrailError;
+use aws_sdk_bedrockruntime::operation::apply_guardrail::{
+    ApplyGuardrailError, ApplyGuardrailOutput,
+};
 use aws_sdk_bedrockruntime::types::{
-    GuardrailAction, GuardrailContentBlock, GuardrailContentSource, GuardrailTextBlock,
+    GuardrailAction, GuardrailAssessment, GuardrailContentBlock, GuardrailContentSource,
+    GuardrailSensitiveInformationPolicyAction, GuardrailTextBlock,
 };
 use aws_sdk_bedrockruntime::Client;
 use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_runtime_api::http::Response;
 
-use crate::{Guardrail, GuardrailVerdict};
+use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome};
 
 /// One Bedrock guardrail row, materialised into a request-time
 /// dispatcher. Built once per snapshot from
@@ -173,25 +177,30 @@ impl BedrockGuardrail {
         }
     }
 
-    /// Run `ApplyGuardrail` against a content block. Wraps the
-    /// SDK call with `latency_mode` enforcement and translates the
-    /// response/error into a `GuardrailVerdict` per §Behavior matrix.
-    async fn apply(&self, source: GuardrailContentSource, text: String) -> GuardrailVerdict {
-        let fail_open = self.fail_open_for(&source);
-        let req = self
+    /// One `ApplyGuardrail` call carrying `texts` as one content block
+    /// each (positional — `outputs[i]` aligns with `texts[i]` when
+    /// Bedrock anonymizes), wrapped with `latency_mode` enforcement.
+    async fn send(
+        &self,
+        source: GuardrailContentSource,
+        texts: &[String],
+    ) -> Result<ApplyGuardrailOutput, BedrockFailure> {
+        let mut req = self
             .client
             .apply_guardrail()
             .guardrail_identifier(&self.guardrail_id)
             .guardrail_version(&self.guardrail_version)
-            .source(source)
-            .content(GuardrailContentBlock::Text(
+            .source(source);
+        for text in texts {
+            req = req.content(GuardrailContentBlock::Text(
                 GuardrailTextBlock::builder()
                     .text(text)
                     .build()
                     .expect("GuardrailTextBlock requires text — set above"),
             ));
+        }
 
-        let result = match self.latency_mode {
+        match self.latency_mode {
             BedrockLatencyMode::Serial => req.send().await.map_err(BedrockFailure::from_sdk),
             BedrockLatencyMode::Timed { timeout_ms } => {
                 match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), req.send())
@@ -202,29 +211,72 @@ impl BedrockGuardrail {
                     Err(_) => Err(BedrockFailure::Timeout),
                 }
             }
-        };
+        }
+    }
 
-        match result {
-            Ok(resp) => match resp.action() {
-                GuardrailAction::GuardrailIntervened => GuardrailVerdict::block(format!(
+    /// Blob-mode `ApplyGuardrail`: one joined content block, verdict only.
+    /// Serves `check_input`/`check_output` — the families with no mask
+    /// write-back channel — so an ANONYMIZE disposition maps to Block
+    /// there (releasing the un-masked content would defeat the operator's
+    /// policy; the segment path is where masking is honored).
+    async fn apply(&self, source: GuardrailContentSource, text: String) -> GuardrailVerdict {
+        let fail_open = self.fail_open_for(&source);
+        match self.send(source, std::slice::from_ref(&text)).await {
+            Ok(resp) => match classify_response(&resp, &self.guardrail_id) {
+                BedrockOutcome::Allow => GuardrailVerdict::Allow,
+                BedrockOutcome::Block => GuardrailVerdict::block(format!(
                     "bedrock guardrail {} intervened",
                     self.guardrail_id
                 )),
-                GuardrailAction::None => GuardrailVerdict::Allow,
-                other => {
-                    // Forward-compat: an unknown enum variant from a
-                    // future SDK upgrade. Treat as no-block (the
-                    // safer interpretation since `intervened` is the
-                    // active-block signal).
-                    tracing::warn!(
-                        guardrail_id = %self.guardrail_id,
-                        action = ?other,
-                        "unknown ApplyGuardrail action; treating as Allow",
-                    );
-                    GuardrailVerdict::Allow
-                }
+                BedrockOutcome::Mask(_) => GuardrailVerdict::block(format!(
+                    "bedrock guardrail {} anonymized content",
+                    self.guardrail_id
+                )),
             },
             Err(failure) => self.handle_failure(failure, fail_open),
+        }
+    }
+
+    /// Segment-mode `ApplyGuardrail`: one content block per text slot,
+    /// verdict + positional mask write-back. On an ANONYMIZE disposition
+    /// Bedrock returns one `outputs[]` entry per input block; when that
+    /// alignment holds the masked texts are returned for write-back.
+    /// When it doesn't (a provider quirk we can't attribute to slots),
+    /// keep the originals and continue — LiteLLM's `_merge_masked_texts`
+    /// fallback: never misapply masked content to the wrong slot.
+    async fn apply_segments(
+        &self,
+        source: GuardrailContentSource,
+        texts: &[String],
+    ) -> SegmentsOutcome {
+        let fail_open = self.fail_open_for(&source);
+        match self.send(source, texts).await {
+            Ok(resp) => match classify_response(&resp, &self.guardrail_id) {
+                BedrockOutcome::Allow => SegmentsOutcome::allow(),
+                BedrockOutcome::Block => SegmentsOutcome::from_verdict(GuardrailVerdict::block(
+                    format!("bedrock guardrail {} intervened", self.guardrail_id),
+                )),
+                BedrockOutcome::Mask(outputs) => {
+                    if outputs.len() == texts.len() {
+                        SegmentsOutcome {
+                            verdict: GuardrailVerdict::Allow,
+                            masked: Some(outputs),
+                            counts: anonymized_counts(&resp),
+                        }
+                    } else {
+                        tracing::warn!(
+                            row = %self.row_name,
+                            guardrail_id = %self.guardrail_id,
+                            expected = texts.len(),
+                            got = outputs.len(),
+                            "bedrock masked outputs don't align with input \
+                             blocks; skipping mask write-back",
+                        );
+                        SegmentsOutcome::allow()
+                    }
+                }
+            },
+            Err(failure) => SegmentsOutcome::from_verdict(self.handle_failure(failure, fail_open)),
         }
     }
 
@@ -247,6 +299,143 @@ impl BedrockGuardrail {
             GuardrailVerdict::block(format!("bedrock unavailable ({reason})"))
         }
     }
+}
+
+/// The masking-aware interpretation of an `ApplyGuardrail` response.
+///
+/// Bedrock reports `action = GUARDRAIL_INTERVENED` for BOTH a hard block
+/// AND a PII anonymization (mask). The two are told apart by the
+/// per-policy actions inside `assessments`: a topic/content/word/
+/// contextual-grounding policy hit, or a PII/regex entity with
+/// `action = BLOCKED`, is a hard block; a PII/regex entity with
+/// `action = ANONYMIZED` (and nothing blocking) is a mask, whose
+/// replacement text Bedrock returns in `outputs[].text`. Mirrors
+/// LiteLLM's `_should_raise_guardrail_blocked_exception` (raise iff any
+/// assessment entry is BLOCKED; otherwise apply the masked output).
+#[derive(Debug, PartialEq, Eq)]
+enum BedrockOutcome {
+    /// `action = NONE` — nothing detected.
+    Allow,
+    /// A hard block: some policy blocked (topic/content/word/contextual)
+    /// or a PII/regex entity had `action = BLOCKED`.
+    Block,
+    /// Only anonymization occurred. Carries the masked replacement text
+    /// per `outputs[]` block, in order and WITHOUT dropping empty entries
+    /// — `outputs[i]` must keep aligning with the i-th input content
+    /// block for the segment write-back.
+    Mask(Vec<String>),
+}
+
+/// Classify an `ApplyGuardrail` response into allow / block / mask.
+/// Secure by default: an intervention that is neither a recognizable
+/// block nor accompanied by masked output is treated as a block.
+fn classify_response(resp: &ApplyGuardrailOutput, guardrail_id: &str) -> BedrockOutcome {
+    match resp.action() {
+        GuardrailAction::None => BedrockOutcome::Allow,
+        GuardrailAction::GuardrailIntervened => {
+            if resp.assessments().iter().any(assessment_has_hard_block) {
+                return BedrockOutcome::Block;
+            }
+            let masked: Vec<String> = resp
+                .outputs()
+                .iter()
+                .map(|o| o.text().unwrap_or_default().to_owned())
+                .collect();
+            if masked.iter().all(String::is_empty) {
+                // Intervened, no recognizable hard block, no masked
+                // output — block rather than risk releasing content whose
+                // disposition we can't read.
+                BedrockOutcome::Block
+            } else {
+                BedrockOutcome::Mask(masked)
+            }
+        }
+        other => {
+            // Forward-compat: an unknown enum variant from a future SDK
+            // upgrade. `intervened` is the active signal, so an unknown
+            // action is treated as no-intervention (Allow).
+            tracing::warn!(
+                guardrail_id = %guardrail_id,
+                action = ?other,
+                "unknown ApplyGuardrail action; treating as Allow",
+            );
+            BedrockOutcome::Allow
+        }
+    }
+}
+
+/// Per-entity counts of what Bedrock ANONYMIZED, for
+/// `redacted_entity_counts` telemetry. Keys are the PII entity TYPE
+/// (`EMAIL`, `PHONE`, …) or the operator's configured regex name —
+/// config-level metadata, never matched values, so the map is safe to
+/// log and attach to telemetry (#153 / #932 no-leak criterion). The
+/// assessment's `match` fields are deliberately never read.
+fn anonymized_counts(resp: &ApplyGuardrailOutput) -> std::collections::BTreeMap<String, u32> {
+    let mut counts = std::collections::BTreeMap::new();
+    for a in resp.assessments() {
+        let Some(sip) = a.sensitive_information_policy() else {
+            continue;
+        };
+        for e in sip.pii_entities() {
+            if *e.action() == GuardrailSensitiveInformationPolicyAction::Anonymized {
+                *counts.entry(e.r#type().as_str().to_owned()).or_insert(0) += 1;
+            }
+        }
+        for r in sip.regexes() {
+            if *r.action() == GuardrailSensitiveInformationPolicyAction::Anonymized {
+                let name = r.name().unwrap_or("regex").to_owned();
+                *counts.entry(name).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// True if the assessment carries any BLOCKING disposition — a
+/// topic/content/word/contextual-grounding entry whose `action` is
+/// BLOCKED, or a PII/regex entity whose action is BLOCKED (as opposed to
+/// ANONYMIZED). Every policy family also has a detect-only mode
+/// (`action = NONE`): entries are returned for observability but nothing
+/// was suppressed, so their mere presence must NOT be read as a block —
+/// mirrors LiteLLM's per-entry BLOCKED check.
+fn assessment_has_hard_block(a: &GuardrailAssessment) -> bool {
+    use aws_sdk_bedrockruntime::types::{
+        GuardrailContentPolicyAction, GuardrailTopicPolicyAction, GuardrailWordPolicyAction,
+    };
+    let topic_blocked = a.topic_policy().is_some_and(|p| {
+        p.topics()
+            .iter()
+            .any(|t| *t.action() == GuardrailTopicPolicyAction::Blocked)
+    });
+    let content_blocked = a.content_policy().is_some_and(|p| {
+        p.filters()
+            .iter()
+            .any(|f| *f.action() == GuardrailContentPolicyAction::Blocked)
+    });
+    let word_blocked = a.word_policy().is_some_and(|p| {
+        p.custom_words()
+            .iter()
+            .any(|w| *w.action() == GuardrailWordPolicyAction::Blocked)
+            || p.managed_word_lists()
+                .iter()
+                .any(|w| *w.action() == GuardrailWordPolicyAction::Blocked)
+    });
+    let grounding_blocked = a.contextual_grounding_policy().is_some_and(|p| {
+        p.filters().iter().any(|f| {
+            *f.action()
+                == aws_sdk_bedrockruntime::types::GuardrailContextualGroundingPolicyAction::Blocked
+        })
+    });
+    let pii_blocked = a.sensitive_information_policy().is_some_and(|sip| {
+        sip.pii_entities()
+            .iter()
+            .any(|e| *e.action() == GuardrailSensitiveInformationPolicyAction::Blocked)
+            || sip
+                .regexes()
+                .iter()
+                .any(|r| *r.action() == GuardrailSensitiveInformationPolicyAction::Blocked)
+    });
+    topic_blocked || content_blocked || word_blocked || grounding_blocked || pii_blocked
 }
 
 /// Failure cause buckets that map onto `guardrail_bypassed_reason`
@@ -360,6 +549,42 @@ impl Guardrail for BedrockGuardrail {
         }
         self.apply(GuardrailContentSource::Output, text).await
     }
+
+    /// Bedrock moderates via the segment pass on call sites that support
+    /// mask write-back; those sites pair `moderate_*_segments` with
+    /// `check_*_non_segment`, so the guardrail is called exactly once.
+    fn moderates_segments(&self) -> bool {
+        true
+    }
+
+    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        if !matches!(
+            self.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        ) {
+            return SegmentsOutcome::allow();
+        }
+        if texts.iter().all(|t| t.is_empty()) {
+            // Nothing to scan — Bedrock would 400 on empty content.
+            return SegmentsOutcome::allow();
+        }
+        self.apply_segments(GuardrailContentSource::Input, texts)
+            .await
+    }
+
+    async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        if !matches!(
+            self.hook_point,
+            GuardrailHookPoint::Output | GuardrailHookPoint::Both
+        ) {
+            return SegmentsOutcome::allow();
+        }
+        if texts.iter().all(|t| t.is_empty()) {
+            return SegmentsOutcome::allow();
+        }
+        self.apply_segments(GuardrailContentSource::Output, texts)
+            .await
+    }
 }
 
 /// Concatenate the request's user-visible message contents into one
@@ -379,6 +604,205 @@ fn collect_input_text(req: &ChatFormat) -> String {
 mod tests {
     use super::*;
     use aisix_core::models::{BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode};
+
+    // --- classify_response: block vs mask vs allow (#932 bedrock) ---------
+    mod classify {
+        use super::super::{assessment_has_hard_block, classify_response, BedrockOutcome};
+        use aws_sdk_bedrockruntime::operation::apply_guardrail::ApplyGuardrailOutput;
+        use aws_sdk_bedrockruntime::types::{
+            GuardrailAction, GuardrailAssessment, GuardrailOutputContent, GuardrailPiiEntityFilter,
+            GuardrailPiiEntityType, GuardrailSensitiveInformationPolicyAction as PiiAction,
+            GuardrailSensitiveInformationPolicyAssessment, GuardrailTopic,
+            GuardrailTopicPolicyAction, GuardrailTopicPolicyAssessment, GuardrailTopicType,
+        };
+
+        fn resp(
+            action: GuardrailAction,
+            outputs: Vec<&str>,
+            assessments: Vec<GuardrailAssessment>,
+        ) -> ApplyGuardrailOutput {
+            ApplyGuardrailOutput::builder()
+                .action(action)
+                .set_outputs(Some(
+                    outputs
+                        .into_iter()
+                        .map(|t| GuardrailOutputContent::builder().text(t).build())
+                        .collect(),
+                ))
+                .set_assessments(Some(assessments))
+                .build()
+                .expect("action/outputs/assessments all set")
+        }
+
+        fn pii(action: PiiAction) -> GuardrailAssessment {
+            let entity = GuardrailPiiEntityFilter::builder()
+                .r#match("alice@example.com")
+                .r#type(GuardrailPiiEntityType::Email)
+                .action(action)
+                .build()
+                .unwrap();
+            let sip = GuardrailSensitiveInformationPolicyAssessment::builder()
+                .pii_entities(entity)
+                .set_regexes(Some(vec![]))
+                .build()
+                .unwrap();
+            GuardrailAssessment::builder()
+                .sensitive_information_policy(sip)
+                .build()
+        }
+
+        fn topic_with(action: GuardrailTopicPolicyAction) -> GuardrailAssessment {
+            let t = GuardrailTopic::builder()
+                .name("blocked-topic")
+                .r#type(GuardrailTopicType::Deny)
+                .action(action)
+                .build()
+                .unwrap();
+            let tp = GuardrailTopicPolicyAssessment::builder()
+                .topics(t)
+                .build()
+                .unwrap();
+            GuardrailAssessment::builder().topic_policy(tp).build()
+        }
+
+        fn topic() -> GuardrailAssessment {
+            topic_with(GuardrailTopicPolicyAction::Blocked)
+        }
+
+        #[test]
+        fn action_none_is_allow() {
+            let r = resp(GuardrailAction::None, vec![], vec![]);
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Allow);
+        }
+
+        #[test]
+        fn anonymized_pii_with_masked_output_is_mask() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["contact {EMAIL} about the order"],
+                vec![pii(PiiAction::Anonymized)],
+            );
+            assert_eq!(
+                classify_response(&r, "gid"),
+                BedrockOutcome::Mask(vec!["contact {EMAIL} about the order".to_owned()])
+            );
+        }
+
+        #[test]
+        fn blocked_pii_is_block() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["irrelevant"],
+                vec![pii(PiiAction::Blocked)],
+            );
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+        }
+
+        #[test]
+        fn topic_policy_hit_is_block_even_with_masked_output() {
+            // A hard block (topic) wins even if masked output is present.
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["masked text"],
+                vec![topic()],
+            );
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+        }
+
+        #[test]
+        fn mixed_anonymized_and_blocked_is_block() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["masked"],
+                vec![pii(PiiAction::Anonymized), pii(PiiAction::Blocked)],
+            );
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+        }
+
+        #[test]
+        fn intervened_without_hard_block_or_masked_output_is_block() {
+            // Secure default: an intervention we can't read as a mask blocks.
+            let r = resp(GuardrailAction::GuardrailIntervened, vec![], vec![]);
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+        }
+
+        #[test]
+        fn hard_block_helper_only_true_for_blocking_dispositions() {
+            assert!(!assessment_has_hard_block(&pii(PiiAction::Anonymized)));
+            assert!(assessment_has_hard_block(&pii(PiiAction::Blocked)));
+            assert!(assessment_has_hard_block(&topic()));
+            // Detect-only (`action=NONE`) entries are observability
+            // metadata, not a block.
+            assert!(!assessment_has_hard_block(&topic_with(
+                GuardrailTopicPolicyAction::None
+            )));
+        }
+
+        /// A detect-mode (`action=NONE`) topic entry alongside an
+        /// ANONYMIZED PII entity must classify as Mask — the topic
+        /// policy observed but did not suppress anything.
+        #[test]
+        fn detect_only_topic_does_not_turn_mask_into_block() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["contact {EMAIL}"],
+                vec![
+                    topic_with(GuardrailTopicPolicyAction::None),
+                    pii(PiiAction::Anonymized),
+                ],
+            );
+            assert_eq!(
+                classify_response(&r, "gid"),
+                BedrockOutcome::Mask(vec!["contact {EMAIL}".to_owned()])
+            );
+        }
+
+        /// Positional integrity: an empty `outputs[]` entry is preserved,
+        /// not dropped — `outputs[i]` must keep aligning with the i-th
+        /// input content block for the segment write-back.
+        #[test]
+        fn mask_preserves_empty_output_positions() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["", "masked tail"],
+                vec![pii(PiiAction::Anonymized)],
+            );
+            assert_eq!(
+                classify_response(&r, "gid"),
+                BedrockOutcome::Mask(vec![String::new(), "masked tail".to_owned()])
+            );
+        }
+
+        /// The anonymized-entity counts read TYPE/name metadata only —
+        /// the matched value ("alice@example.com" in the fixture) never
+        /// appears in a key.
+        #[test]
+        fn anonymized_counts_carry_types_not_values() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["{EMAIL}"],
+                vec![pii(PiiAction::Anonymized), pii(PiiAction::Anonymized)],
+            );
+            let counts = super::super::anonymized_counts(&r);
+            assert_eq!(counts.get("EMAIL"), Some(&2));
+            assert_eq!(counts.len(), 1);
+            assert!(
+                !counts.keys().any(|k| k.contains("alice")),
+                "matched values must never leak into count keys",
+            );
+        }
+
+        /// BLOCKED entities don't show up in the anonymize counts.
+        #[test]
+        fn anonymized_counts_skip_blocked_entities() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec![],
+                vec![pii(PiiAction::Blocked)],
+            );
+            assert!(super::super::anonymized_counts(&r).is_empty());
+        }
+    }
 
     fn cfg() -> BedrockConfig {
         BedrockConfig {
@@ -792,5 +1216,205 @@ mod tests {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_timeout"),
             other => panic!("expected Bypass(bedrock_timeout), got {other:?}"),
         }
+    }
+
+    // --- segment mode (mask write-back, #932 bedrock follow-up) ----------
+
+    fn anonymized_body(outputs: Vec<&str>) -> serde_json::Value {
+        json!({
+            "action": "GUARDRAIL_INTERVENED",
+            "outputs": outputs.into_iter().map(|t| json!({"text": t})).collect::<Vec<_>>(),
+            "assessments": [{
+                "sensitiveInformationPolicy": {
+                    "piiEntities": [
+                        {"match": "alice@example.com", "type": "EMAIL", "action": "ANONYMIZED"}
+                    ],
+                    "regexes": []
+                }
+            }],
+            "usage": {
+                "topicPolicyUnits": 0,
+                "contentPolicyUnits": 0,
+                "wordPolicyUnits": 0,
+                "sensitiveInformationPolicyUnits": 1,
+                "sensitiveInformationPolicyFreeUnits": 0,
+                "contextualGroundingPolicyUnits": 0
+            }
+        })
+    }
+
+    /// Segment mode sends ONE call with one content block per text slot,
+    /// and an aligned ANONYMIZED response comes back as positional masked
+    /// texts + entity-type counts.
+    #[tokio::test]
+    async fn apply_segments_sends_one_block_per_text_and_masks_positionally() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(anonymized_body(vec!["seg one", "mail {EMAIL} now"])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), true);
+        let texts = vec![
+            "seg one".to_owned(),
+            "mail alice@example.com now".to_owned(),
+        ];
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &texts)
+            .await;
+
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(
+            outcome.masked,
+            Some(vec!["seg one".to_owned(), "mail {EMAIL} now".to_owned()]),
+        );
+        assert_eq!(outcome.counts.get("EMAIL"), Some(&1));
+
+        // The single request must carry the two slots as two content
+        // blocks (positional contract with `outputs[]`).
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let content = body.get("content").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(content.len(), 2, "one content block per text slot");
+        assert_eq!(
+            content[0].pointer("/text/text").and_then(|v| v.as_str()),
+            Some("seg one"),
+        );
+        assert_eq!(
+            content[1].pointer("/text/text").and_then(|v| v.as_str()),
+            Some("mail alice@example.com now"),
+        );
+    }
+
+    /// The defensive fallback (LiteLLM `_merge_masked_texts` semantics):
+    /// masked outputs that can't be aligned positionally are NOT applied
+    /// — originals stand, the request continues.
+    #[tokio::test]
+    async fn apply_segments_misaligned_outputs_keep_originals_and_allow() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(
+                // 2 input slots, only 1 output — cannot attribute.
+                ResponseTemplate::new(200).set_body_json(anonymized_body(vec!["one blob"])),
+            )
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), true);
+        let texts = vec!["a".to_owned(), "b".to_owned()];
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &texts)
+            .await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.masked, None, "misaligned mask must not be applied");
+    }
+
+    /// A hard block (BLOCKED PII entity) on the segment path still
+    /// blocks — masking never bypasses a blocking disposition.
+    #[tokio::test]
+    async fn apply_segments_hard_block_still_blocks() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "action": "GUARDRAIL_INTERVENED",
+                "outputs": [{"text": "blocked message"}],
+                "assessments": [{
+                    "sensitiveInformationPolicy": {
+                        "piiEntities": [
+                            {"match": "x", "type": "EMAIL", "action": "BLOCKED"}
+                        ],
+                        "regexes": []
+                    }
+                }],
+                "usage": {
+                    "topicPolicyUnits": 0,
+                    "contentPolicyUnits": 0,
+                    "wordPolicyUnits": 0,
+                    "sensitiveInformationPolicyUnits": 1,
+                    "sensitiveInformationPolicyFreeUnits": 0,
+                    "contextualGroundingPolicyUnits": 0
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), true);
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &["x".to_owned()])
+            .await;
+        assert!(outcome.verdict.is_block());
+        assert_eq!(outcome.masked, None);
+    }
+
+    /// Blob mode (`check_*`, the families with no write-back channel)
+    /// keeps mapping an ANONYMIZE disposition to Block — releasing the
+    /// un-masked content there would defeat the operator's policy.
+    #[tokio::test]
+    async fn blob_apply_still_blocks_on_anonymize() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(anonymized_body(vec!["{EMAIL}"])),
+            )
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), true);
+        let v = g
+            .apply(GuardrailContentSource::Input, "alice@example.com".into())
+            .await;
+        match v {
+            GuardrailVerdict::Block { reason, .. } => {
+                assert!(reason.contains("anonymized content"), "got {reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    /// Segment-path failures keep the fail-open/closed contract: a 5xx
+    /// with `fail_open=false` blocks, with `fail_open=true` bypasses.
+    #[tokio::test]
+    async fn apply_segments_5xx_honors_fail_open() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "__type": "InternalServerException",
+                "message": "boom"
+            })))
+            .mount(&server)
+            .await;
+
+        let open = build_with_endpoint(server.uri(), true);
+        let outcome = open
+            .apply_segments(GuardrailContentSource::Input, &["x".to_owned()])
+            .await;
+        assert!(outcome.verdict.is_bypass());
+
+        let closed = build_with_endpoint(server.uri(), false);
+        let outcome = closed
+            .apply_segments(GuardrailContentSource::Input, &["x".to_owned()])
+            .await;
+        assert!(outcome.verdict.is_block());
+    }
+
+    /// Hook-point gating carries over to the segment hooks: an
+    /// Output-only row must not scan input segments (Allow without ever
+    /// hitting AWS), mirroring `output_only_row_skips_input_check`.
+    #[tokio::test]
+    async fn output_only_row_skips_input_segments() {
+        let mut g = build_test(true);
+        g.hook_point = GuardrailHookPoint::Output;
+        let outcome = g.moderate_input_segments(&["hello".to_owned()]).await;
+        assert_eq!(outcome, SegmentsOutcome::allow());
     }
 }
