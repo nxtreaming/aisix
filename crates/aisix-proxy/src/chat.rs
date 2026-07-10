@@ -21,8 +21,8 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LlmUsage, Metrics, RequestLabels,
-    RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, Metrics,
+    RequestLabels, RequestOutcome, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -400,6 +400,16 @@ pub async fn chat_completions(
             };
             state.metrics.record_proxy_request(fail_labels, elapsed);
             state.metrics.record_llm_request(fail_labels, elapsed);
+            state.metrics.record_request_e2e_latency(
+                LatencyLabels {
+                    endpoint: "/v1/chat/completions",
+                    model: metric_model,
+                    provider: "unknown",
+                    status,
+                    streaming: req.is_streaming(),
+                },
+                elapsed,
+            );
             emit_access_log(
                 method,
                 path,
@@ -1518,6 +1528,26 @@ async fn dispatch(
                     u64::from(comp.prompt_tokens),
                     u64::from(comp.completion_tokens),
                     comp.total_tokens,
+                );
+                metrics_for_stream.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/chat/completions",
+                        model: &model_for_metrics,
+                        provider: &provider_for_metrics,
+                        status: 200,
+                        streaming: true,
+                    },
+                    started.elapsed(),
+                );
+                metrics_for_stream.record_request_ttft(
+                    LatencyLabels {
+                        endpoint: "/v1/chat/completions",
+                        model: &model_for_metrics,
+                        provider: &provider_for_metrics,
+                        status: 200,
+                        streaming: true,
+                    },
+                    Duration::from_millis(u64::from(comp.ttft_ms)),
                 );
                 metrics_for_stream.record_time_to_first_token(
                     UsageLabels {
@@ -2669,6 +2699,31 @@ async fn dispatch_ensemble(
                     &client_for_telem,
                     /* content */ None,
                 );
+                // SLO histograms (AISIX-Cloud#1011): the handler's
+                // record_success is stream-gated, so the ensemble stream
+                // records its e2e/TTFT here like the plain streaming path.
+                state_for_telem.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/chat/completions",
+                        model: &client_model_for_telem,
+                        // Matches the legacy series: no single provider
+                        // governs an ensemble response.
+                        provider: "ensemble",
+                        status: 200,
+                        streaming: true,
+                    },
+                    started.elapsed(),
+                );
+                state_for_telem.metrics.record_request_ttft(
+                    LatencyLabels {
+                        endpoint: "/v1/chat/completions",
+                        model: &client_model_for_telem,
+                        provider: "ensemble",
+                        status: 200,
+                        streaming: true,
+                    },
+                    Duration::from_millis(u64::from(comp.ttft_ms)),
+                );
                 // Release the concurrency permit(s) now the stream is done
                 // (or was cancelled) — on_complete fires on both paths (#450).
                 drop(stream_concurrency_hold);
@@ -3009,6 +3064,21 @@ fn record_success(
     };
     metrics.record_proxy_request(request_labels, elapsed);
     metrics.record_llm_request(request_labels, elapsed);
+    // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
+    // `elapsed` for a stream is time-to-response-start; the stream's
+    // on_complete records the full duration instead.
+    if !stream {
+        metrics.record_request_e2e_latency(
+            LatencyLabels {
+                endpoint: "/v1/chat/completions",
+                model,
+                provider,
+                status,
+                streaming: false,
+            },
+            elapsed,
+        );
+    }
     if let Some(total) = s.total_tokens {
         metrics.record_tokens(provider, model, total);
     }
