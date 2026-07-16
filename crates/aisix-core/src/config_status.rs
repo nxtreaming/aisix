@@ -387,6 +387,15 @@ impl ConfigStatus {
         self.inner.lock().unwrap().ever_applied
     }
 
+    /// The hash of the last applied (served) config snapshot, or `None`
+    /// when no snapshot has been applied yet this boot. A cheap targeted
+    /// read for callers that need only the hash — the heartbeat's
+    /// per-node config-verification field — without building the full
+    /// [`Self::view`] / [`Self::metrics`] snapshot.
+    pub fn applied_config_hash(&self) -> Option<String> {
+        self.inner.lock().unwrap().config_hash.clone()
+    }
+
     /// Point-in-time JSON view for `GET /status/config`.
     pub fn view(&self) -> ConfigStatusView {
         self.inner.lock().unwrap().view()
@@ -708,6 +717,47 @@ mod tests {
         assert_eq!(applied.resource_counts.get("models"), Some(&2));
         assert_eq!(applied.apply_seq, 1);
         assert!(v.last_failure.is_none());
+    }
+
+    #[test]
+    fn applied_config_hash_is_none_until_applied_then_tracks_latest() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        assert_eq!(cs.applied_config_hash(), None);
+        // Distinct source vs applied hashes: a regression reading the
+        // observed source_hash instead of the served config_hash would
+        // pass with equal values, so keep them apart.
+        cs.record_load(LoadObservation {
+            source_hash: "src1".into(),
+            observed_revision: Some(1),
+            applied: Some(applied("applied1", &[("models", 1)])),
+            rejected: vec![],
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        // Must be the APPLIED (served) hash, never the observed source_hash.
+        assert_eq!(cs.applied_config_hash().as_deref(), Some("applied1"));
+        // A later apply carrying a new hash is reflected.
+        cs.record_load(LoadObservation {
+            source_hash: "src2".into(),
+            observed_revision: Some(2),
+            applied: Some(applied("applied2", &[("models", 1)])),
+            rejected: vec![],
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        assert_eq!(cs.applied_config_hash().as_deref(), Some("applied2"));
+        // A wholly-rejected reload keeps the last-good applied hash even
+        // as source_hash advances — we report what we serve, not what we
+        // observed.
+        cs.record_load(LoadObservation {
+            source_hash: "src3".into(),
+            observed_revision: Some(3),
+            applied: None,
+            rejected: vec![],
+            is_reload: true,
+            wholly_rejected: true,
+        });
+        assert_eq!(cs.applied_config_hash().as_deref(), Some("applied2"));
     }
 
     #[test]
