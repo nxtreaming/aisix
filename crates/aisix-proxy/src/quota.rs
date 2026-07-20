@@ -293,6 +293,42 @@ pub(crate) async fn reserve_model_only(
     Ok(MultiReservation::new(reservations))
 }
 
+/// Reserve the model-scoped layers for one routing-dispatch target (Model
+/// Group / semantic-router member), mirroring the ensemble per-sub-call
+/// reservation (#620). Returns `Ok(None)` for a direct (non-routing)
+/// dispatch: there the target IS the requested entry, whose model layers
+/// were already reserved pre-dispatch by [`enforce`]/[`enforce_rate_limit`],
+/// so reserving again would double-count the request (AISIX-Cloud#1087).
+///
+/// An `Err` means this target is over one of its own limits right now —
+/// the dispatch loops treat that as a failed 429 attempt and continue with
+/// the remaining targets (matching LiteLLM, which filters rate-limited
+/// deployments out of the candidate set).
+pub(crate) async fn reserve_routing_target(
+    state: &ProxyState,
+    is_routing_request: bool,
+    target_name: &str,
+    target_entry_id: &str,
+    target: &aisix_core::Model,
+) -> Result<Option<MultiReservation>, ProxyError> {
+    if !is_routing_request {
+        return Ok(None);
+    }
+    reserve_model_only(state, target_name, target_entry_id, target)
+        .await
+        .map(Some)
+}
+
+/// Seconds until the offending window reopens, for a
+/// [`reserve_routing_target`] rejection. `chat.rs` funnels its rejection
+/// through a `BridgeError`, which would otherwise drop the hint the
+/// `/v1/messages` and `/v1/responses` loops keep by carrying the
+/// `ProxyError::RateLimit` itself — so every endpoint's all-targets-exhausted
+/// 429 lands with the same `Retry-After`.
+pub(crate) fn retry_after_of(err: &ProxyError) -> Option<u64> {
+    err.retry_after_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
