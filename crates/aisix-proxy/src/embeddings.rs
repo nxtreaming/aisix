@@ -170,6 +170,7 @@ pub async fn embeddings(
                     status,
                     elapsed,
                     success.prompt_tokens,
+                    success.usage_estimated,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -242,6 +243,9 @@ struct EmbedDispatchSuccess {
     /// into `content_mode = full`.
     captured_content: Option<CapturedContent>,
     prompt_tokens: u32,
+    /// True when `prompt_tokens` came from the local estimator because
+    /// the upstream reported no usage (AISIX-Cloud#1074).
+    usage_estimated: bool,
     /// `true` when the dispatch produced a real 200 from the upstream
     /// (we have authoritative usage data to attribute). `false` for the
     /// 501-NotImplemented branch where no upstream call was made.
@@ -401,18 +405,37 @@ async fn dispatch(
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&body.model);
             state.runtime_status.mark_healthy(&model_entry.id);
+            // Token accounting (#226 / AISIX-Cloud#1074). Embeddings are
+            // input-only, so `prompt_tokens == total_tokens` on the OpenAI
+            // shape. Providers that report only `total_tokens` (e.g. some
+            // rerank/embed backends) get prompt from total — upstream-
+            // authoritative, not an estimate. Only when the upstream
+            // reports nothing at all does the local estimator count the
+            // request `input`. Telemetry only — the response body is
+            // forwarded untouched.
+            let (prompt_tokens, usage_estimated) = if embed_resp.usage.prompt_tokens > 0 {
+                (embed_resp.usage.prompt_tokens, false)
+            } else if embed_resp.usage.total_tokens > 0 {
+                (embed_resp.usage.total_tokens, false)
+            } else {
+                let upstream_model = model.upstream_model().unwrap_or("unknown");
+                let estimated = req.input.iter().fold(0u32, |acc, s| {
+                    acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
+                });
+                (estimated, estimated > 0)
+            };
             // Commit the reservation — release the concurrency permit
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
-            // here even though other handlers commit 0.
+            // here even though other handlers commit 0. The estimation
+            // fallback above keeps this accurate for upstreams that
+            // report no usage.
             reservation
-                .commit_tokens(embed_resp.usage.total_tokens as u64)
+                .commit_tokens(u64::from(
+                    (embed_resp.usage.total_tokens).max(prompt_tokens),
+                ))
                 .await;
             let provider_label = provider.to_ascii_lowercase();
-            // Capture the prompt_tokens count BEFORE moving the
-            // embed_resp into the JSON response — the handler needs
-            // this for UsageEvent emission downstream (#226).
-            let prompt_tokens = embed_resp.usage.prompt_tokens;
             // Content capture (#700): the full response JSON, vectors
             // included (LiteLLM parity); CapturedContent::new truncates to
             // the cap.
@@ -433,6 +456,7 @@ async fn dispatch(
                 redactions: redactions.clone(),
                 monitor_hits: monitor_hits.clone(),
                 prompt_tokens,
+                usage_estimated,
                 upstream_called: true,
                 captured_content,
             })
@@ -455,6 +479,7 @@ async fn dispatch(
                 redactions: redactions.clone(),
                 monitor_hits: monitor_hits.clone(),
                 prompt_tokens: 0,
+                usage_estimated: false,
                 captured_content: None,
                 // No upstream call happened — the handler reads this
                 // and skips UsageEvent emission. Distinguished from
@@ -544,6 +569,7 @@ fn emit_usage_event(
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
+    usage_estimated: bool,
     client: &ClientContext,
     // Per-detector PII mask counts (#932) applied to the input.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -587,6 +613,7 @@ fn emit_usage_event(
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens,
+        usage_estimated,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
@@ -781,6 +808,102 @@ mod tests {
         );
         assert_eq!(ev.applied_guardrails[0].kind, "keyword");
         assert_eq!(ev.applied_guardrails[0].hook, "input");
+    }
+
+    /// AISIX-Cloud#1074: an embeddings upstream that reports only
+    /// `total_tokens` (no `prompt_tokens`) fills prompt from total —
+    /// upstream-authoritative, NOT estimated, so the event stays
+    /// unflagged. Pre-#1074 this recorded prompt_tokens=0.
+    #[tokio::test]
+    async fn prompt_falls_back_to_total_tokens_unflagged() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1_f32]}],
+                "model": "text-embedding-3-small",
+                "usage": {"total_tokens": 6}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "my-embed", "input": "hello world"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.prompt_tokens, 6, "prompt falls back to total_tokens");
+        assert!(
+            !ev.usage_estimated,
+            "total_tokens is upstream-authoritative, not an estimate"
+        );
+    }
+
+    /// AISIX-Cloud#1074: an embeddings upstream that reports NO usage at
+    /// all gets the prompt estimated from the request `input` and the
+    /// event flagged. "hello world" = 2 tokens (cl100k, and the seeded
+    /// model name text-embedding-3-small maps to cl100k too).
+    #[tokio::test]
+    async fn prompt_estimated_and_flagged_when_usage_absent() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1_f32]}],
+                "model": "text-embedding-3-small"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "my-embed", "input": "hello world"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.prompt_tokens, 2, "estimated from the request input");
+        assert!(ev.usage_estimated, "locally-counted tokens must be flagged");
     }
 
     /// #719: /v1/embeddings explicitly bypassed all guardrails, so a content
