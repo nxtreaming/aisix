@@ -744,6 +744,44 @@ pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> Stri
     out
 }
 
+/// #1074 ensemble sub-call token fallback. A sub-call backend (a panel
+/// member, or the judge) that reports no usage would otherwise record
+/// silent zeros; estimate the prompt from that sub-call's own request
+/// (`req`: the client request for a panel member — every member shares the
+/// inbound messages — or the synthesis request for the judge) and the
+/// completion from the sub-call's answer text. `model` is the sub-call's
+/// resolved **upstream** model (not the operator alias) so the tokenizer
+/// encoding matches the real backend, consistent with the direct and
+/// streaming-judge paths. Returns `(prompt, completion, usage_estimated)`
+/// under the #794 or-semantics: a non-zero upstream value always wins,
+/// estimation fills only zeros. One helper so every sub-call emit site
+/// (non-streaming panel + judge, streaming panel) can't drift apart.
+fn estimate_subcall_tokens(
+    req: &ChatFormat,
+    model: &str,
+    usage: &aisix_gateway::chat::UsageStats,
+    output_text: &str,
+) -> (u32, u32, bool) {
+    if usage.prompt_tokens != 0 && usage.completion_tokens != 0 {
+        return (usage.prompt_tokens, usage.completion_tokens, false);
+    }
+    let est = crate::token_estimate::Estimator::new(
+        model,
+        crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+    );
+    let filled = crate::token_estimate::fill_missing(
+        &est,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        Some(output_text),
+    );
+    (
+        filled.prompt_tokens,
+        filled.completion_tokens,
+        filled.estimated,
+    )
+}
+
 fn last_user_message_text(req: &ChatFormat) -> Option<String> {
     req.messages
         .iter()
@@ -2548,16 +2586,26 @@ async fn dispatch_ensemble(
         ))
     })?;
 
-    // Resolve a sub-call's target by display_name → (model_id, provider_key_id)
-    // for telemetry; empty pair if the target was deleted between dispatch and
-    // emit (cp-api stores NULL). Shared by both the success and 502 paths.
-    let resolve_sub = |display_name: &str| -> (String, String) {
+    // Resolve a sub-call's target by display_name → (model_id, provider_key_id,
+    // upstream_model). The first two are telemetry attribution; the third is
+    // the tokenizer key for the #1074 estimation fallback — the estimator keys
+    // off the real upstream model, not the operator alias, exactly as the
+    // direct and streaming-judge paths do (a `gpt-4o` alias must select
+    // o200k_base, not the cl100k default an unrecognised alias falls back to).
+    // Empty ids if the target was deleted between dispatch and emit (cp-api
+    // stores NULL); the tokenizer then degrades to the display name.
+    let resolve_sub = |display_name: &str| -> (String, String, String) {
         match snapshot.models.get_by_name(display_name) {
             Some(entry) => (
                 entry.id.clone(),
                 entry.value.provider_key_id.clone().unwrap_or_default(),
+                entry
+                    .value
+                    .upstream_model()
+                    .unwrap_or(display_name)
+                    .to_string(),
             ),
-            None => (String::new(), String::new()),
+            None => (String::new(), String::new(), display_name.to_string()),
         }
     };
     // Emit one usage event for a single (already-billed) panel member.
@@ -2568,7 +2616,18 @@ async fn dispatch_ensemble(
     // 0-based slot; `blocked` sets the event's `guardrail_blocked` flag.
     let emit_panel_member =
         |member: &crate::ensemble::PanelOutcome, index: usize, blocked: bool, bypass: &str| {
-            let (sub_model_id, sub_provider_key_id) = resolve_sub(&member.model);
+            let (sub_model_id, sub_provider_key_id, sub_upstream_model) =
+                resolve_sub(&member.model);
+            // #1074: a member backend that omitted usage gets its prompt
+            // estimated from the shared client request and its completion
+            // from the member's own answer text, tokenized with the member's
+            // resolved upstream model.
+            let (prompt_tokens, completion_tokens, usage_estimated) = estimate_subcall_tokens(
+                req,
+                &sub_upstream_model,
+                &member.usage,
+                &member.est_output_text,
+            );
             emit_usage_event(
                 state,
                 request_id,
@@ -2577,13 +2636,14 @@ async fn dispatch_ensemble(
                 api_key_id,
                 200,
                 started.elapsed(),
-                member.usage.prompt_tokens,
-                member.usage.completion_tokens,
+                prompt_tokens,
+                completion_tokens,
                 UsageExtras {
                     cached_prompt_tokens: member.usage.cached_prompt_tokens,
                     reasoning_tokens: member.usage.reasoning_tokens,
                     cache_creation_tokens: member.usage.cache_creation_tokens,
                     cache_read_tokens: member.usage.cache_read_tokens,
+                    usage_estimated,
                     bypass_reason: bypass.to_string(),
                     cache_status: CacheStatus::Disabled.as_str().to_string(),
                     attempt_index: index as u32,
@@ -2768,19 +2828,31 @@ async fn dispatch_ensemble(
             provider_key_id: String,
             attempt_model: String,
             usage: aisix_gateway::chat::UsageStats,
+            est_output_text: String,
+            /// Resolved upstream model — the tokenizer key for the #1074
+            /// estimate, pre-resolved here because the `'static` closure
+            /// can't reach the snapshot (mirrors `model_id`).
+            est_model: String,
         }
         let panel_telem: Vec<PanelTelem> = panel
             .iter()
             .map(|p| {
-                let (model_id, provider_key_id) = resolve_sub(&p.model);
+                let (model_id, provider_key_id, est_model) = resolve_sub(&p.model);
                 PanelTelem {
                     model_id,
                     provider_key_id,
                     attempt_model: p.model.clone(),
                     usage: p.usage.clone(),
+                    est_output_text: p.est_output_text.clone(),
+                    est_model,
                 }
             })
             .collect();
+        // #1074: the `'static` on_complete closure cannot borrow `req`, so
+        // capture one clone for the panel-member prompt estimate (used only
+        // when a member backend omits usage — the guard in
+        // `estimate_subcall_tokens` skips the tokenizer otherwise).
+        let req_for_panel_est = req.clone();
         let panel_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
         // #614: field-wise panel usage sum (not just total_tokens) folded into
         // the client-facing terminal usage chunk via build_sse_stream's
@@ -2791,7 +2863,9 @@ async fn dispatch_ensemble(
             .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                 acc.saturating_add(&p.usage)
             });
-        let (judge_model_id, judge_provider_key_id) = resolve_sub(&ensemble_cfg.judge.model);
+        // The streamed judge estimator keys off `judge_model.upstream_model()`
+        // directly (below), so resolve_sub's upstream_model is unused here.
+        let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&ensemble_cfg.judge.model);
         let judge_attempt_model = ensemble_cfg.judge.model.clone();
         let judge_attempt_index = panel.len() as u32;
 
@@ -2885,6 +2959,17 @@ async fn dispatch_ensemble(
                 // moved into on_complete because the judge counts only land on
                 // the terminal SSE chunk.
                 for (index, member) in panel_telem.iter().enumerate() {
+                    // #1074: same or-semantics fallback as the non-streaming
+                    // panel emit — estimate a member's tokens when its backend
+                    // omitted usage (members were buffered, so their answer
+                    // text is available even though the judge is streamed).
+                    let (prompt_tokens, completion_tokens, usage_estimated) =
+                        estimate_subcall_tokens(
+                            &req_for_panel_est,
+                            &member.est_model,
+                            &member.usage,
+                            &member.est_output_text,
+                        );
                     emit_usage_event(
                         &state_for_telem,
                         &request_id_for_telem,
@@ -2893,13 +2978,14 @@ async fn dispatch_ensemble(
                         &api_key_id_for_telem,
                         200,
                         started.elapsed(),
-                        member.usage.prompt_tokens,
-                        member.usage.completion_tokens,
+                        prompt_tokens,
+                        completion_tokens,
                         UsageExtras {
                             cached_prompt_tokens: member.usage.cached_prompt_tokens,
                             reasoning_tokens: member.usage.reasoning_tokens,
                             cache_creation_tokens: member.usage.cache_creation_tokens,
                             cache_read_tokens: member.usage.cache_read_tokens,
+                            usage_estimated,
                             bypass_reason: bypass_for_telem.clone(),
                             cache_status: CacheStatus::Disabled.as_str().to_string(),
                             attempt_index: index as u32,
@@ -3113,7 +3199,19 @@ async fn dispatch_ensemble(
         for (index, member) in outcome.panel.iter().enumerate() {
             emit_panel_member(member, index, blocked, bypass);
         }
-        let (judge_model_id, judge_provider_key_id) = resolve_sub(&outcome.judge_model);
+        let (judge_model_id, judge_provider_key_id, judge_upstream_model) =
+            resolve_sub(&outcome.judge_model);
+        // #1074: estimate the judge sub-call when its backend omitted usage —
+        // prompt from the judge's synthesis request, completion from the
+        // synthesized answer text (read post-mask; token count is
+        // mask-invariant to within placeholder length), tokenized with the
+        // judge's resolved upstream model.
+        let (judge_prompt, judge_completion, judge_estimated) = estimate_subcall_tokens(
+            &outcome.judge_req,
+            &judge_upstream_model,
+            &judge_usage,
+            &estimation_output_text(&outcome.response),
+        );
         emit_usage_event(
             state,
             request_id,
@@ -3122,13 +3220,14 @@ async fn dispatch_ensemble(
             api_key_id,
             200,
             started.elapsed(),
-            judge_usage.prompt_tokens,
-            judge_usage.completion_tokens,
+            judge_prompt,
+            judge_completion,
             UsageExtras {
                 cached_prompt_tokens: judge_usage.cached_prompt_tokens,
                 reasoning_tokens: judge_usage.reasoning_tokens,
                 cache_creation_tokens: judge_usage.cache_creation_tokens,
                 cache_read_tokens: judge_usage.cache_read_tokens,
+                usage_estimated: judge_estimated,
                 provider_request_id: outcome.response.id.clone(),
                 provider_model_version: outcome.response.model.clone(),
                 finish_reason: finish_reason_label(&outcome.response.finish_reason),
@@ -4930,7 +5029,7 @@ mod complete_on_drop_tests {
     //! StreamCompletion, set the shared atomic to simulate "N
     //! chunks delivered to the consumer", drop, observe the
     //! callback args.
-    use super::{AtomicU32, CompleteOnDrop, StreamCompletion};
+    use super::{estimate_subcall_tokens, AtomicU32, CompleteOnDrop, StreamCompletion};
     use std::sync::{Arc, Mutex};
 
     /// Build the guard with `delivered_count` pre-set on the
@@ -5052,6 +5151,68 @@ mod complete_on_drop_tests {
         assert_eq!(out.completion_tokens, 23);
         assert_eq!(out.total_tokens, 40);
         assert!(!out.usage_estimated);
+    }
+
+    fn subcall_req(user: &str) -> aisix_gateway::chat::ChatFormat {
+        aisix_gateway::chat::ChatFormat::new(
+            "relay-model",
+            vec![aisix_gateway::chat::ChatMessage {
+                role: aisix_gateway::chat::Role::User,
+                content: Some(user.into()),
+                content_blocks: None,
+                name: None,
+                tool_call_id: None,
+                extra: serde_json::Map::new(),
+            }],
+        )
+    }
+
+    /// #796: the shared ensemble sub-call estimator fills a fully-missing
+    /// usage block — prompt from the sub-call's request (one user "Hello"
+    /// = 8 in the cl100k fallback), completion from its answer text
+    /// ("Hello world" = 2) — and flags it.
+    #[test]
+    fn estimate_subcall_fills_missing_usage() {
+        let usage = aisix_gateway::chat::UsageStats::default();
+        let (prompt, completion, estimated) =
+            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        assert_eq!(prompt, 8);
+        assert_eq!(completion, 2);
+        assert!(estimated);
+    }
+
+    /// #796: a sub-call whose backend DID report usage is returned
+    /// verbatim and unflagged — the answer text is ignored.
+    #[test]
+    fn estimate_subcall_preserves_reported_usage() {
+        let usage = aisix_gateway::chat::UsageStats {
+            prompt_tokens: 17,
+            completion_tokens: 23,
+            total_tokens: 40,
+            ..Default::default()
+        };
+        let (prompt, completion, estimated) =
+            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        assert_eq!(prompt, 17);
+        assert_eq!(completion, 23);
+        assert!(!estimated);
+    }
+
+    /// #796: per-field or-semantics — a reported prompt is kept while a
+    /// missing completion is estimated (and the record is flagged).
+    #[test]
+    fn estimate_subcall_fills_only_missing_side() {
+        let usage = aisix_gateway::chat::UsageStats {
+            prompt_tokens: 17,
+            completion_tokens: 0,
+            total_tokens: 17,
+            ..Default::default()
+        };
+        let (prompt, completion, estimated) =
+            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        assert_eq!(prompt, 17, "reported prompt preserved");
+        assert_eq!(completion, 2, "missing completion estimated");
+        assert!(estimated);
     }
 
     #[test]
