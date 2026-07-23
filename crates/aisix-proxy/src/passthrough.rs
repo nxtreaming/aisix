@@ -392,9 +392,21 @@ async fn dispatch(
     }
 
     // Reserve the rate-limit layers AFTER the input guardrail so a content
-    // block doesn't burn an RPM slot, matching the typed endpoints. Passthrough
-    // has no resolved model, so only the api-key/team/member layers apply.
-    let _reservation = crate::quota::enforce(&state, auth, None).await?;
+    // block doesn't burn an RPM slot, matching the typed endpoints.
+    //
+    // api7/AISIX-Cloud#1116: provider-native JSON envelopes carry the target
+    // model in a top-level `model` field (the shape shared by OpenAI-compatible
+    // and DashScope-style bodies). When that name is a configured Model of the
+    // addressed provider, reserve its model-level layers (inline `rate_limit`
+    // + `model`-scope policies) exactly like the typed endpoints — pre-fix the
+    // raw tunnel skipped them entirely, so e.g. a video model reachable only
+    // through passthrough had no enforceable model rate limit anywhere.
+    // Non-JSON bodies, bodies without a `model` field, and unregistered names
+    // keep the previous behavior: request-level layers only. The tunnel never
+    // parses usage (tokens stay 0), so only the request-count dimensions
+    // (rps/rpm/rph) ever draw from the model buckets here.
+    let model_rl = body_model_rate_limit(&snapshot, &provider_lower, &body_bytes);
+    let _reservation = crate::quota::enforce(&state, auth, model_rl.as_ref()).await?;
 
     let client = crate::http_client::client();
     let mut builder = client.request(method.clone(), &url);
@@ -564,6 +576,66 @@ async fn dispatch(
     }
 
     Ok((response, provider_lower, pk_entry.id.to_string()))
+}
+
+/// Model-level rate-limit identity for a passthrough request, resolved from
+/// the JSON body's top-level `model` field (api7/AISIX-Cloud#1116).
+///
+/// The name is matched against the addressed provider's configured Models
+/// twice over: an exact `display_name` hit first (the gateway alias), then
+/// the provider-native `model_name` — the tunnel forwards bodies verbatim,
+/// so callers typically name the upstream id, not the gateway alias. Either
+/// way the reservation is keyed by the entry's `display_name`, so tunnel
+/// and typed traffic to the same Model draw from one bucket.
+///
+/// Returns `None` when the body is not JSON, carries no string `model`
+/// field, or nothing matches within the addressed provider — the request
+/// then reserves only the request-level layers, mirroring the pre-fix
+/// behavior. A same-named Model of a different provider never matches.
+/// Wildcard (`*`) display names are a typed-endpoint resolution feature,
+/// not replicated here.
+fn body_model_rate_limit(
+    snapshot: &aisix_core::AisixSnapshot,
+    provider_lower: &str,
+    body: &[u8],
+) -> Option<crate::quota::ModelRateLimit> {
+    // Field probe, not a full `Value` DOM: unknown fields are skipped
+    // without allocating, so a large tunnel body costs one `String` here,
+    // not a parsed copy of itself. A non-string `model` fails the whole
+    // deserialize and lands on the same `None` fallback.
+    #[derive(serde::Deserialize)]
+    struct BodyModelProbe {
+        model: Option<String>,
+    }
+    let name = serde_json::from_slice::<BodyModelProbe>(body).ok()?.model?;
+    let matches_provider = |m: &aisix_core::Model| {
+        m.provider
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(provider_lower))
+    };
+    let entry = snapshot
+        .models
+        .get_by_name(&name)
+        .filter(|e| matches_provider(&e.value))
+        .or_else(|| {
+            // Provider-native id fallback. `min_by_key` keeps the pick
+            // deterministic when several Models pin the same upstream id.
+            snapshot
+                .models
+                .entries()
+                .into_iter()
+                .filter(|e| {
+                    matches_provider(&e.value)
+                        && e.value.model_name.as_deref() == Some(name.as_str())
+                        && !e.value.display_name.contains('*')
+                })
+                .min_by_key(|e| e.id.clone())
+        })?;
+    Some(crate::quota::ModelRateLimit::from_model(
+        &entry.value.display_name,
+        &entry.id,
+        &entry.value,
+    ))
 }
 
 /// #699: push one zero-token `UsageEvent` per passthrough request onto the
